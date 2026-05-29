@@ -42,9 +42,15 @@ _indexes_created = False
 def _get_db():
     global _client, _db, _indexes_created
     if _db is None:
-        uri     = os.getenv("MONGO_URI", "mongodb://localhost:27017/film_judging")
+        uri     = os.getenv("MONGODB_URI") or os.getenv("MONGO_URI", "mongodb://localhost:27017/festival_reviewer")
+        db_name = os.getenv("MONGO_DB_NAME", "")
         _client = MongoClient(uri, serverSelectionTimeoutMS=5000)
-        _db     = _client.get_default_database() if "/" in uri.rsplit("@", 1)[-1] else _client["film_judging"]
+        if db_name:
+            _db = _client[db_name]
+        elif "/" in uri.rsplit("@", 1)[-1]:
+            _db = _client.get_default_database()
+        else:
+            _db = _client["festival_reviewer"]
     if not _indexes_created:
         _indexes_created = True
         _create_indexes(_db)
@@ -85,6 +91,12 @@ def _create_indexes(d):
         expireAfterSeconds=TTL_JOBS_DAYS * 86400,
         name="ttl_jobs",
     )
+
+    # ── users ──────────────────────────────────────────────────────────────
+    d["users"].create_index("email", unique=True, name="uniq_email")
+
+    # ── festivals ──────────────────────────────────────────────────────────
+    d["festivals"].create_index("key", unique=True, name="uniq_festival_key")
 
 
 def _now() -> datetime:
@@ -129,15 +141,17 @@ def film_find_by_screener(screener_url: str) -> dict | None:
     )
 
 
-def film_find_by_identity(title: str, director: str) -> dict | None:
+def film_find_by_identity(title: str, director: str, duration_min: float | None = None) -> dict | None:
+    """Match by title+director. If duration_min given, also require runtime within ±2 min."""
     if not title or not director:
         return None
-    return _clean_film(
-        _get_db()["films"].find_one({
-            "title_lc":    title.strip().lower(),
-            "director_lc": director.strip().lower(),
-        })
-    )
+    query: dict = {
+        "title_lc":    title.strip().lower(),
+        "director_lc": director.strip().lower(),
+    }
+    if duration_min is not None:
+        query["runtime_min"] = {"$gte": duration_min - 2, "$lte": duration_min + 2}
+    return _clean_film(_get_db()["films"].find_one(query))
 
 
 def film_create(data: dict) -> str:
@@ -154,6 +168,7 @@ def film_create(data: dict) -> str:
         "director_statement": data.get("director_statement", ""),
         "genre":              data.get("genre", ""),
         "runtime":            data.get("runtime", ""),
+        "runtime_min":        data.get("runtime_min"),
         "country":            data.get("country", ""),
         "screener_url":       data.get("screener_url", ""),
         "analysis":           data.get("analysis") or {},
@@ -174,7 +189,7 @@ def film_save_analysis(film_id: str, analysis: dict):
 
 def film_update_meta(film_id: str, data: dict):
     """Update editable metadata fields."""
-    fields = ["logline", "director_statement", "genre", "runtime", "country", "screener_url"]
+    fields = ["logline", "director_statement", "genre", "runtime", "runtime_min", "country", "screener_url"]
     updates = {k: data[k] for k in fields if k in data}
     if updates:
         _get_db()["films"].update_one({"film_id": film_id}, {"$set": updates})
@@ -266,3 +281,98 @@ def job_update(job_id: str, updates: dict):
         {"job_id": job_id},
         {"$set": updates},
     )
+
+
+# ── User helpers ──────────────────────────────────────────────────────────────
+
+def _clean_user(doc: dict | None) -> dict | None:
+    if doc is None:
+        return None
+    doc = dict(doc)
+    doc.pop("_id", None)
+    doc.pop("password_hash", None)          # never leak the hash
+    if isinstance(doc.get("created_at"), datetime):
+        doc["created_at"] = doc["created_at"].isoformat()
+    return doc
+
+
+def user_list() -> list[dict]:
+    docs = _get_db()["users"].find({}, sort=[("created_at", ASCENDING)])
+    return [_clean_user(d) for d in docs]
+
+
+def user_get(email: str) -> dict | None:
+    """Return full user doc including password_hash (for auth only)."""
+    doc = _get_db()["users"].find_one({"email": email.strip().lower()})
+    if doc is None:
+        return None
+    doc = dict(doc)
+    doc.pop("_id", None)
+    if isinstance(doc.get("created_at"), datetime):
+        doc["created_at"] = doc["created_at"].isoformat()
+    return doc
+
+
+def user_create(email: str, password_hash: str, role: str = "user", festival_key: str = "") -> bool:
+    """Insert a new user. Returns False if email already exists."""
+    try:
+        _get_db()["users"].insert_one({
+            "email":         email.strip().lower(),
+            "password_hash": password_hash,
+            "role":          role,
+            "festival_key":  festival_key if role != "admin" else "",
+            "created_at":    _now(),
+        })
+        return True
+    except Exception:
+        return False
+
+
+def user_delete(email: str) -> bool:
+    """Delete a user by email. Returns False if not found."""
+    result = _get_db()["users"].delete_one({"email": email.strip().lower()})
+    return result.deleted_count > 0
+
+
+def user_count() -> int:
+    return _get_db()["users"].count_documents({})
+
+
+# ── Festival helpers ──────────────────────────────────────────────────────────
+
+def _clean_festival(doc: dict | None) -> dict | None:
+    if doc is None:
+        return None
+    doc = dict(doc)
+    doc.pop("_id", None)
+    if isinstance(doc.get("created_at"), datetime):
+        doc["created_at"] = doc["created_at"].isoformat()
+    return doc
+
+
+def festival_list() -> list[dict]:
+    return [_clean_festival(d) for d in _get_db()["festivals"].find({}, sort=[("name", ASCENDING)])]
+
+
+def festival_get(key: str) -> dict | None:
+    return _clean_festival(_get_db()["festivals"].find_one({"key": key}))
+
+
+def festival_upsert(key: str, data: dict):
+    """Insert or update a festival document."""
+    doc = {k: v for k, v in data.items() if k != "_id"}
+    doc["key"] = key
+    _get_db()["festivals"].update_one(
+        {"key": key},
+        {"$set": doc, "$setOnInsert": {"created_at": _now()}},
+        upsert=True,
+    )
+
+
+def festival_delete(key: str) -> bool:
+    result = _get_db()["festivals"].delete_one({"key": key})
+    return result.deleted_count > 0
+
+
+def festival_count() -> int:
+    return _get_db()["festivals"].count_documents({})

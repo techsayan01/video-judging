@@ -111,17 +111,25 @@ Return ONLY valid JSON — no markdown, no preamble:
 """
 
 
+MAX_REVIEW_WORDS = 500
+
+
 def build_review_prompt(film_meta: dict, analysis: dict, festival: dict) -> str:
     """
     Build the expert review generation prompt for a given festival.
+    Word count is capped at MAX_REVIEW_WORDS globally.
+    If the festival has a custom review_prompt, it is injected as the
+    festival-specific writing guidelines section.
     """
-    word_count = festival.get("word_count", 300)
-    guidelines = festival.get("review_guidelines", "").strip()
+    word_count   = min(int(festival.get("word_count", 300) or 300), MAX_REVIEW_WORDS)
+    custom_prompt = festival.get("review_prompt", "").strip()
+    guidelines   = custom_prompt or festival.get("review_guidelines", "").strip()
+    tone         = festival.get("tone", "professional, honest, and encouraging")
 
     return f"""
 You are a senior programmer at {festival['full_name']}, writing an Expert Review
 for a filmmaker who paid for professional feedback.
-Write exactly {word_count} words.
+Write exactly {word_count} words — no more, no fewer.
 
 FILM DETAILS:
 Title:     {film_meta.get('title', 'Unknown')}
@@ -151,7 +159,7 @@ UNIVERSAL RULES:
 - Do NOT start with "This film" or "The film"
 - Do NOT use: compelling, captivating, masterful, stunning
 - Sound human — vary sentence length, include at least one short punchy sentence
-- Tone: {festival['tone']}
+- Tone: {tone}
 """
 
 

@@ -1,41 +1,56 @@
 #!/bin/bash
 # deploy.sh — One command GCP Cloud Run deployment
 # Usage: ./deploy.sh
+#
+# Secret Manager keys required (create once with gcloud secrets create):
+#   flask-secret          — random 32-byte hex string
+#   gemini-api-key        — global Gemini API key (festival-specific ones added in admin UI)
+#   mongodb-uri           — full MongoDB Atlas connection string
+#   admin-1-email         — admin-sayan's email
+#   admin-1-pass          — admin-sayan's password (hashed on first boot, never stored plain)
+#   admin-2-email         — admin-joyi's email
+#   admin-2-pass          — admin-joyi's password
+#
+# Optional (only if using GCS streaming for large videos):
+#   gcs-bucket            — GCS bucket name
+#
+# Create a secret:
+#   echo -n "value" | gcloud secrets create secret-name --data-file=-
+# Update a secret:
+#   echo -n "new-value" | gcloud secrets versions add secret-name --data-file=-
 
-PROJECT_ID="your-gcp-project-id"       # change this
-REGION="asia-south1"                    # Mumbai — closest to Kolkata
-SERVICE_NAME="festival-review-app"
-IMAGE="gcr.io/$PROJECT_ID/$SERVICE_NAME"
+set -euo pipefail
 
-echo "🚀 Deploying $SERVICE_NAME to Cloud Run ($REGION)"
+PROJECT_ID="personal-workspace-490012"
+REGION="asia-south1"
+SERVICE_NAME="festival-reviewer"
+IMAGE="asia-south1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/$SERVICE_NAME"
 
-# Build and push
-gcloud builds submit --tag $IMAGE .
+echo "Building image via Cloud Build..."
+gcloud builds submit --tag "$IMAGE" --project "$PROJECT_ID" .
 
-# Deploy to Cloud Run
-gcloud run deploy $SERVICE_NAME \
-  --image $IMAGE \
+echo "Deploying to Cloud Run ($REGION)..."
+gcloud run deploy "$SERVICE_NAME" \
+  --image "$IMAGE" \
   --platform managed \
-  --region $REGION \
+  --region "$REGION" \
+  --project "$PROJECT_ID" \
   --memory 2Gi \
   --cpu 2 \
   --timeout 600 \
   --concurrency 10 \
   --min-instances 0 \
   --max-instances 3 \
-  --no-allow-unauthenticated \
-  --set-env-vars "FESTIVAL_NAME=ElegantIFF" \
+  --allow-unauthenticated \
+  --set-env-vars "HTTPS=true" \
   --set-secrets \
-    "GEMINI_API_KEY=gemini-api-key:latest,\
-     USER1_EMAIL=user1-email:latest,\
-     USER1_PASS=user1-pass:latest,\
-     USER2_EMAIL=user2-email:latest,\
-     USER2_PASS=user2-pass:latest,\
-     FLASK_SECRET=flask-secret:latest"
+    "FLASK_SECRET=flask-secret:latest,\
+GEMINI_API_KEY=gemini-api-key:latest,\
+MONGODB_URI=mongodb-uri:latest,\
+ADMIN_1_EMAIL=admin-1-email:latest,\
+ADMIN_1_PASS=admin-1-pass:latest,\
+ADMIN_2_EMAIL=admin-2-email:latest,\
+ADMIN_2_PASS=admin-2-pass:latest"
 
 echo ""
-echo "✅ Deployed. Grant employee access:"
-echo "gcloud run services add-iam-policy-binding $SERVICE_NAME \\"
-echo "  --region=$REGION \\"
-echo "  --member='user:employee@email.com' \\"
-echo "  --role='roles/run.invoker'"
+echo "Deployed: $(gcloud run services describe $SERVICE_NAME --region $REGION --project $PROJECT_ID --format 'value(status.url)')"

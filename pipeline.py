@@ -91,17 +91,11 @@ def process_submission(sub: dict, festival: dict) -> dict:
         print(f"  [skip] No screener URL")
         return {"skipped": True, "entry_id": entry_id, "reason": "no screener"}
 
-    # ── DB dedup check ─────────────────────────────────────────────────────
-    existing = (
-        db.film_find_by_screener(sub.get("screener_url", "")) or
-        db.film_find_by_identity(sub.get("title", ""), sub.get("director", ""))
-    )
-
+    # ── Fast dedup on screener URL (no download needed) ───────────────────
+    existing = db.film_find_by_screener(sub.get("screener_url", ""))
     if existing and existing.get("analysis"):
         film_id = existing["film_id"]
-        print(f"  [cache hit] Film in DB (id={film_id[:8]}) — skipping video upload")
-
-        # Check if a review for this festival already exists
+        print(f"  [cache hit] URL match in DB (id={film_id[:8]}) — skipping video upload")
         existing_review = db.review_get(film_id, festival_key)
         if existing_review and existing_review.get("review_text"):
             print(f"  [cache hit] Review already exists for {festival['name']} — skipping entirely")
@@ -111,9 +105,6 @@ def process_submission(sub: dict, festival: dict) -> dict:
                 review_draft=existing_review["review_text"],
                 festival_key=festival_key, festival_name=festival["name"],
             )
-
-        # Regenerate review text only (no video)
-        print(f"  [rewrite] Generating review for {festival['name']} from cached analysis")
         review_draft = generate_expert_review(sub, existing["analysis"], festival)
         db.review_upsert(film_id, festival_key, review_draft)
         return save_to_queue(
@@ -122,7 +113,7 @@ def process_submission(sub: dict, festival: dict) -> dict:
             festival_key=festival_key, festival_name=festival["name"],
         )
 
-    # ── Full analysis path ─────────────────────────────────────────────────
+    # ── Download video to extract runtime for dedup ────────────────────────
     dl = download_screener(
         screener_url=sub.get("screener_url", ""),
         password=sub.get("screener_password", ""),
@@ -136,8 +127,37 @@ def process_submission(sub: dict, festival: dict) -> dict:
 
     video_path   = dl["path"]
     duration_min = dl["duration_min"]
-    frame_paths  = []
-    transcript   = ""
+    runtime_str  = f"{round(duration_min)} min"
+
+    # ── Full dedup: title + director + runtime (±2 min tolerance) ─────────
+    existing = db.film_find_by_identity(
+        sub.get("title", ""), sub.get("director", ""), duration_min
+    )
+    if existing and existing.get("analysis"):
+        film_id = existing["film_id"]
+        print(f"  [cache hit] title+director+runtime match (id={film_id[:8]}) — skipping analysis")
+        existing_review = db.review_get(film_id, festival_key)
+        if existing_review and existing_review.get("review_text"):
+            print(f"  [cache hit] Review already exists for {festival['name']} — skipping entirely")
+            return save_to_queue(
+                entry_id=entry_id, film_meta={**sub, "runtime": runtime_str},
+                analysis=existing["analysis"],
+                review_draft=existing_review["review_text"],
+                festival_key=festival_key, festival_name=festival["name"],
+            )
+        review_draft = generate_expert_review(
+            {**sub, "runtime": runtime_str}, existing["analysis"], festival
+        )
+        db.review_upsert(film_id, festival_key, review_draft)
+        return save_to_queue(
+            entry_id=entry_id, film_meta={**sub, "runtime": runtime_str},
+            analysis=existing["analysis"], review_draft=review_draft,
+            festival_key=festival_key, festival_name=festival["name"],
+        )
+
+    # ── Full analysis path ─────────────────────────────────────────────────
+    frame_paths = []
+    transcript  = ""
 
     if duration_min > SHORT_FILM_MAX_MIN:
         print(f"  [long film] {duration_min:.1f} min — extracting frames + transcript")
@@ -149,7 +169,7 @@ def process_submission(sub: dict, festival: dict) -> dict:
     result = analyse_film(
         video_path=video_path,
         duration_min=duration_min,
-        film_meta=sub,
+        film_meta={**sub, "runtime": runtime_str},
         festival=festival,
         frame_paths=frame_paths,
         transcript=transcript,
@@ -160,20 +180,17 @@ def process_submission(sub: dict, festival: dict) -> dict:
                              festival_key=festival_key, error=result["error"])
 
     # Persist film + review to DB so future festivals can skip the video
-    film_id = existing["film_id"] if existing else None
-    if not film_id:
-        film_id = db.film_create({
-            "title":              sub.get("title", ""),
-            "director":           sub.get("director", ""),
-            "director_statement": sub.get("director_statement", ""),
-            "genre":              sub.get("genre", ""),
-            "runtime":            sub.get("runtime", ""),
-            "country":            sub.get("country", ""),
-            "screener_url":       sub.get("screener_url", ""),
-            "analysis":           result["analysis"],
-        })
-    else:
-        db.film_save_analysis(film_id, result["analysis"])
+    film_id = db.film_create({
+        "title":              sub.get("title", ""),
+        "director":           sub.get("director", ""),
+        "director_statement": sub.get("director_statement", ""),
+        "genre":              sub.get("genre", ""),
+        "runtime":            runtime_str,
+        "runtime_min":        duration_min,
+        "country":            sub.get("country", ""),
+        "screener_url":       sub.get("screener_url", ""),
+        "analysis":           result["analysis"],
+    })
 
     db.review_upsert(film_id, festival_key, result["review_draft"])
 

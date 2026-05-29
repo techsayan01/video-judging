@@ -33,6 +33,9 @@ def _cfg(slug: str, **kwargs) -> dict:
         "wp_url":         os.getenv(f"{env}_WP_URL", ""),
         "wp_user":        os.getenv(f"{env}_WP_USER", "admin"),
         "wp_app_pass":    os.getenv(f"{env}_WP_PASS", ""),
+        "email_domains":  kwargs.get("email_domains", []),
+        "review_prompt":  kwargs.get("review_prompt", ""),
+        "word_count":     500,
     }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -174,3 +177,11 @@ if DEFAULT_FESTIVAL not in FESTIVALS:
 def get_festival(key: str) -> dict:
     """Return festival config by key, falling back to default."""
     return FESTIVALS.get(key, FESTIVALS[DEFAULT_FESTIVAL])
+
+
+# domain → festival_key lookup (e.g. "elegantiff.com" → "elegantiff")
+DOMAIN_FESTIVAL_MAP: dict[str, str] = {
+    domain: key
+    for key, cfg in FESTIVALS.items()
+    for domain in cfg.get("email_domains", [])
+}

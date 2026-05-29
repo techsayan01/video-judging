@@ -1,8 +1,66 @@
 import os
+import re
 import subprocess
 import json
 from pathlib import Path
 from config import DOWNLOADS_DIR, FRAMES_DIR, LONG_FILM_FRAME_FPS
+
+
+def _safe_entry_id(entry_id: str) -> str:
+    """Allow only hex/alphanumeric chars to prevent path traversal."""
+    safe = re.sub(r"[^a-zA-Z0-9_-]", "", entry_id)[:128]
+    if not safe:
+        raise ValueError(f"Invalid entry_id: {entry_id!r}")
+    return safe
+
+
+def stream_to_gcs(screener_url: str, password: str, bucket: str, blob_name: str) -> tuple[str, float]:
+    """
+    Pipe yt-dlp stdout directly into a GCS object — no local disk write.
+    Returns (gs_uri, duration_min).
+    Raises on failure.
+    """
+    from google.cloud import storage as gcs_lib
+
+    cmd = [
+        "yt-dlp",
+        "-o", "-",
+        "--format", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+        "--merge-output-format", "mp4",
+        "--quiet", "--no-warnings",
+    ]
+    if password:
+        cmd += ["--video-password", password]
+    cmd.append(screener_url)
+
+    client = gcs_lib.Client()
+    blob   = client.bucket(bucket).blob(blob_name)
+
+    with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as proc:
+        blob.upload_from_file(proc.stdout, content_type="video/mp4")
+        proc.wait()
+        if proc.returncode not in (0, None):
+            err = proc.stderr.read().decode(errors="ignore")[:300]
+            raise RuntimeError(f"yt-dlp failed: {err}")
+
+    gs_uri = f"gs://{bucket}/{blob_name}"
+    print(f"  [gcs] Streamed to {gs_uri}")
+
+    # Get duration via ffprobe on the GCS-signed URL
+    signed = blob.generate_signed_url(expiration=300, method="GET",
+                                       version="v4")
+    duration_min = get_video_duration(signed)
+    return gs_uri, duration_min
+
+
+def delete_from_gcs(bucket: str, blob_name: str):
+    """Delete a GCS object. Silent if already gone."""
+    try:
+        from google.cloud import storage as gcs_lib
+        gcs_lib.Client().bucket(bucket).blob(blob_name).delete()
+        print(f"  [gcs] Deleted gs://{bucket}/{blob_name}")
+    except Exception as e:
+        print(f"  [gcs] Delete failed (non-fatal): {e}")
 
 os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 os.makedirs(FRAMES_DIR, exist_ok=True)
@@ -13,7 +71,12 @@ def download_screener(screener_url: str, password: str, entry_id: str) -> dict:
     Download film from FilmFreeway screener link (Vimeo/Drive/Dropbox).
     Returns: {"path": str, "duration_min": float, "size_mb": float, "success": bool}
     """
+    entry_id    = _safe_entry_id(entry_id)
     output_path = Path(DOWNLOADS_DIR) / f"{entry_id}.mp4"
+    # Resolve and confirm the path stays inside DOWNLOADS_DIR (path traversal guard)
+    output_path = output_path.resolve()
+    if not str(output_path).startswith(str(Path(DOWNLOADS_DIR).resolve())):
+        raise ValueError(f"Path traversal detected for entry_id: {entry_id}")
 
     if output_path.exists():
         print(f"  [cache] {entry_id} already downloaded")
@@ -76,6 +139,7 @@ def extract_keyframes(video_path: str, entry_id: str) -> list[str]:
     Used when film > SHORT_FILM_MAX_MIN.
     Returns list of frame paths.
     """
+    entry_id  = _safe_entry_id(entry_id)
     frame_dir = Path(FRAMES_DIR) / entry_id
     frame_dir.mkdir(parents=True, exist_ok=True)
 
