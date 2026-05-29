@@ -33,7 +33,6 @@ load_dotenv()
 
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET", uuid.uuid4().hex)
-db.init_db()
 
 # ── Config ────────────────────────────────────────────────
 MAX_UPLOAD_MB  = 1800

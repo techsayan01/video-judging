@@ -36,18 +36,23 @@ TTL_FILMS_DAYS = int(os.getenv("TTL_FILMS_DAYS", "365"))
 TTL_JOBS_DAYS  = int(os.getenv("TTL_JOBS_DAYS",  "2"))
 
 
+_indexes_created = False
+
+
 def _get_db():
-    global _client, _db
+    global _client, _db, _indexes_created
     if _db is None:
-        uri    = os.getenv("MONGO_URI", "mongodb://localhost:27017/film_judging")
-        _client = MongoClient(uri)
+        uri     = os.getenv("MONGO_URI", "mongodb://localhost:27017/film_judging")
+        _client = MongoClient(uri, serverSelectionTimeoutMS=5000)
         _db     = _client.get_default_database() if "/" in uri.rsplit("@", 1)[-1] else _client["film_judging"]
+    if not _indexes_created:
+        _indexes_created = True
+        _create_indexes(_db)
     return _db
 
 
-def init_db():
-    """Create indexes. Safe to call multiple times (idempotent)."""
-    d = _get_db()
+def _create_indexes(d):
+    """Create all indexes. Called once on first DB connection."""
 
     # ── films ──────────────────────────────────────────────────────────────
     films = d["films"]
@@ -84,6 +89,11 @@ def init_db():
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def init_db():
+    """No-op kept for compatibility — indexes are created lazily on first _get_db() call."""
+    pass
 
 
 # ── Film helpers ──────────────────────────────────────────────────────────────
