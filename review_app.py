@@ -590,10 +590,9 @@ input[type=file]{display:none}
         <div class="form-group">
           <label>Select Festival *</label>
           <select id="festivalKey" onchange="onFestivalChange(this)">
+            <option value="" disabled selected>— Select a festival —</option>
             {% for key, f in festivals.items() %}
-            <option value="{{ key }}"{% if key == default_festival %} selected{% endif %}>
-              {{ f.name }} — {{ f.focus }}
-            </option>
+            <option value="{{ key }}">{{ f.name }} — {{ f.focus }}</option>
             {% endfor %}
           </select>
           <div class="festival-hint" id="festivalHint"></div>
@@ -602,7 +601,7 @@ input[type=file]{display:none}
     </div>
 
     <!-- Film library picker -->
-    <div class="card">
+    <div class="card" id="libraryCard" style="display:none">
       <div class="card-head">
         <div class="card-head-icon">🗂</div>
         <div class="card-head-title">Film Library — Reuse Cached Analysis</div>
@@ -619,7 +618,7 @@ input[type=file]{display:none}
     </div>
 
     <!-- Film details -->
-    <div class="card" id="formCard">
+    <div class="card" id="formCard" style="display:none">
       <div class="card-head">
         <div class="card-head-icon">🎬</div>
         <div class="card-head-title">Film Details</div>
@@ -665,7 +664,7 @@ input[type=file]{display:none}
     </div>
 
     <!-- Upload (hidden when library film selected) -->
-    <div class="card" id="uploadCard">
+    <div class="card" id="uploadCard" style="display:none">
       <div class="card-head">
         <div class="card-head-icon">📁</div>
         <div class="card-head-title">Upload Film</div>
@@ -768,14 +767,24 @@ const FESTIVALS = {
 
 // ── On load ────────────────────────────────────────────────
 window.addEventListener('DOMContentLoaded', async () => {
-  onFestivalChange(document.getElementById('festivalKey'));
   await loadLibrary();
+  // Do NOT call onFestivalChange on load — nothing is selected yet
 });
 
 function onFestivalChange(sel) {
+  if (!sel.value) return;
   const f = FESTIVALS[sel.value];
   document.getElementById('festivalHint').textContent =
     f ? `${f.words}-word review · ${f.focus}` : '';
+
+  // Reveal the rest of the form now that a festival is chosen
+  document.getElementById('libraryCard').style.display = 'block';
+  document.getElementById('formCard').style.display    = 'block';
+  // uploadCard visibility is controlled by library selection; show by default
+  if (!selectedFilmId) {
+    document.getElementById('uploadCard').style.display  = 'block';
+    document.getElementById('rewriteCard').style.display = 'none';
+  }
 }
 
 // ── Film library ───────────────────────────────────────────
@@ -858,6 +867,8 @@ function handleFile(file) {
 
 // ── Submit: new video ──────────────────────────────────────
 async function submitReview() {
+  const festivalKey = document.getElementById('festivalKey').value;
+  if (!festivalKey) { showError('Please select a festival before submitting'); return; }
   const title    = document.getElementById('title').value.trim();
   const director = document.getElementById('director').value.trim();
   if (!title || !director) { showError('Film title and director are required'); return; }
@@ -901,6 +912,8 @@ async function submitReview() {
 
 // ── Submit: rewrite from cache ─────────────────────────────
 async function submitRewrite() {
+  const festivalKey = document.getElementById('festivalKey').value;
+  if (!festivalKey) { showRewriteError('Please select a festival before submitting'); return; }
   const title    = document.getElementById('title').value.trim();
   const director = document.getElementById('director').value.trim();
   if (!title || !director) { showRewriteError('Film title and director are required'); return; }
@@ -1044,11 +1057,16 @@ function resetForm() {
   document.getElementById('resultsCard').classList.remove('active');
   document.getElementById('formSection').style.display = 'block';
   clearFilmFields();
-  document.getElementById('synopsis').value  = '';
+  document.getElementById('synopsis').value       = '';
   document.getElementById('fileInfo').textContent = '';
-  document.getElementById('submitBtn').disabled  = true;
-  document.getElementById('libraryFilm').value   = '';
-  document.getElementById('uploadCard').style.display  = 'block';
+  document.getElementById('submitBtn').disabled   = true;
+  document.getElementById('libraryFilm').value    = '';
+  document.getElementById('festivalKey').value    = '';
+  document.getElementById('festivalHint').textContent = '';
+  // Hide everything below festival picker until a new festival is chosen
+  document.getElementById('libraryCard').style.display = 'none';
+  document.getElementById('formCard').style.display    = 'none';
+  document.getElementById('uploadCard').style.display  = 'none';
   document.getElementById('rewriteCard').style.display = 'none';
   dropZone.classList.remove('has-file');
   selectedFile   = null;
