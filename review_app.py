@@ -53,7 +53,7 @@ def process_video(job_id: str, video_path: str, meta: dict):
     festival = get_festival(meta.get("festival_key", DEFAULT_FESTIVAL))
 
     client = genai.Client(api_key=festival["gemini_api_key"])
-    model_id = festival.get("gemini_model", "gemini-2.0-flash")
+    model_id = festival.get("gemini_model", "gemini-2.5-flash")
     uploaded_file = None
     try:
         # Step 1: Upload to Gemini using festival's own API key
@@ -87,7 +87,11 @@ def process_video(job_id: str, video_path: str, meta: dict):
         review_resp = client.models.generate_content(
             model=model_id,
             contents=build_review_prompt(meta, analysis, festival),
-            config=types.GenerateContentConfig(temperature=0.7, max_output_tokens=800),
+            config=types.GenerateContentConfig(
+                temperature=0.7,
+                max_output_tokens=2048,
+                thinking_config=types.ThinkingConfig(thinking_budget=0),
+            ),
         )
 
         job.update({

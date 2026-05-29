@@ -22,7 +22,7 @@ def _client(festival: dict) -> genai.Client:
 
 
 def _model(festival: dict) -> str:
-    return festival.get("gemini_model", "gemini-2.0-flash")
+    return festival.get("gemini_model", "gemini-2.5-flash")
 
 
 # ── Short film: direct video upload ──────────────────────────────────────────
@@ -100,7 +100,11 @@ def generate_expert_review(film_meta: dict, analysis: dict, festival: dict) -> s
     response = client.models.generate_content(
         model=_model(festival),
         contents=build_review_prompt(film_meta, analysis, festival),
-        config=types.GenerateContentConfig(temperature=0.7, max_output_tokens=800),
+        config=types.GenerateContentConfig(
+            temperature=0.7,
+            max_output_tokens=2048,
+            thinking_config=types.ThinkingConfig(thinking_budget=0),
+        ),
     )
     return response.text.strip()
 
