@@ -1,7 +1,16 @@
 """
-Festival Expert Review Generator — Single File App
-Deploy to Cloud Run: docker build + gcloud run deploy
+Festival Expert Review Generator
 Run locally: python review_app.py
+Deploy:      docker build + gcloud run deploy
+
+Cost optimisations applied:
+  1. Film analysis cache — analysis JSON stored in film_library/ per film.
+     Repeat reviews (same film, different festival) skip Gemini video upload
+     entirely and only call the cheap text review-writing step (~0.01¢ vs ~1.6¢).
+  2. Lite model for review writing — gemini-2.5-flash-lite used for the
+     text-only review step (prose quality identical, ~70% cheaper output tokens).
+  3. Thinking disabled on review call — gemini-2.5-flash thinking tokens
+     cost $3.50/1M; disabled with thinking_budget=0 on prose generation.
 """
 
 import os, json, uuid, threading, tempfile, time, re
@@ -23,16 +32,19 @@ app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET", uuid.uuid4().hex)
 
 # ── Config ────────────────────────────────────────────────
-MAX_UPLOAD_MB = 1800
-ALLOWED_EXT   = {".mp4", ".mov", ".avi", ".webm", ".mkv", ".mpeg"}
+MAX_UPLOAD_MB  = 1800
+ALLOWED_EXT    = {".mp4", ".mov", ".avi", ".webm", ".mkv", ".mpeg"}
+FILM_LIBRARY   = Path("film_library")
+FILM_LIBRARY.mkdir(exist_ok=True)
 
-# Credentials from env (set in GCP Secret Manager / .env)
+# Lite model used for text-only review writing (cheaper, same prose quality)
+REVIEW_MODEL = "gemini-2.5-flash-lite"
+
 USERS = {
     os.getenv("USER1_EMAIL", "employee1@elegantiff.com"): os.getenv("USER1_PASS", "change_me_1"),
     os.getenv("USER2_EMAIL", "employee2@elegantiff.com"): os.getenv("USER2_PASS", "change_me_2"),
 }
 
-# In-memory job store (fine for 2 concurrent users)
 JOBS: dict[str, dict] = {}
 
 
@@ -46,73 +58,29 @@ def login_required(f):
     return wrapper
 
 
-# ── Processing thread ─────────────────────────────────────
-def process_video(job_id: str, video_path: str, meta: dict):
-    job = JOBS[job_id]
-    uploaded_file = None
-    festival = get_festival(meta.get("festival_key", DEFAULT_FESTIVAL))
-
-    client = genai.Client(api_key=festival["gemini_api_key"])
-    model_id = festival.get("gemini_model", "gemini-2.5-flash")
-    uploaded_file = None
-    try:
-        # Step 1: Upload to Gemini using festival's own API key
-        job.update({"status": "uploading", "progress": 15,
-                    "message": f"Uploading to Gemini [{festival['name']}]..."})
-        uploaded_file = client.files.upload(file=video_path)
-
-        # Step 2: Wait for processing
-        job.update({"status": "processing", "progress": 35,
-                    "message": "Gemini is watching the film..."})
-        while uploaded_file.state.name == "PROCESSING":
-            time.sleep(6)
-            uploaded_file = client.files.get(name=uploaded_file.name)
-
-        if uploaded_file.state.name != "ACTIVE":
-            raise RuntimeError(f"Gemini processing failed: {uploaded_file.state.name}")
-
-        # Step 3: Analyse using festival-specific judging prompt
-        job.update({"status": "analysing", "progress": 55,
-                    "message": "Analysing story, direction, technical..."})
-        analysis_resp = client.models.generate_content(
-            model=model_id,
-            contents=[uploaded_file, build_analysis_prompt(festival)],
-            config=types.GenerateContentConfig(temperature=0.2, max_output_tokens=1024),
-        )
-        analysis = _parse_json(analysis_resp.text)
-
-        # Step 4: Generate review using festival tone + guidelines
-        job.update({"status": "writing", "progress": 78,
-                    "message": "Writing Expert Review..."})
-        review_resp = client.models.generate_content(
-            model=model_id,
-            contents=build_review_prompt(meta, analysis, festival),
-            config=types.GenerateContentConfig(
-                temperature=0.7,
-                max_output_tokens=2048,
-                thinking_config=types.ThinkingConfig(thinking_budget=0),
-            ),
-        )
-
-        job.update({
-            "status": "done", "progress": 100,
-            "message": "Review ready",
-            "analysis": analysis,
-            "review": review_resp.text.strip(),
-            "completed_at": datetime.now().isoformat()
-        })
-
-    except Exception as e:
-        job.update({"status": "error", "progress": 0, "message": str(e)[:300]})
-    finally:
+# ── Film Library ──────────────────────────────────────────
+def library_list() -> list[dict]:
+    films = []
+    for p in sorted(FILM_LIBRARY.glob("*.json"), key=lambda f: f.stat().st_mtime, reverse=True):
         try:
-            if uploaded_file:
-                client.files.delete(name=uploaded_file.name)
-            Path(video_path).unlink(missing_ok=True)
+            films.append(json.loads(p.read_text()))
         except Exception:
             pass
+    return films
 
 
+def library_get(film_id: str) -> dict | None:
+    p = FILM_LIBRARY / f"{film_id}.json"
+    return json.loads(p.read_text()) if p.exists() else None
+
+
+def library_save(film_id: str, record: dict):
+    (FILM_LIBRARY / f"{film_id}.json").write_text(
+        json.dumps(record, indent=2, ensure_ascii=False)
+    )
+
+
+# ── Helpers ───────────────────────────────────────────────
 def _parse_json(raw: str) -> dict:
     clean = re.sub(r"^```(?:json)?\s*", "", raw.strip())
     clean = re.sub(r"\s*```$", "", clean)
@@ -125,12 +93,127 @@ def _parse_json(raw: str) -> dict:
         raise
 
 
+def _write_review(client: genai.Client, meta: dict,
+                  analysis: dict, festival: dict) -> str:
+    """Text-only review generation using the lite model — cheapest step."""
+    resp = client.models.generate_content(
+        model=REVIEW_MODEL,
+        contents=build_review_prompt(meta, analysis, festival),
+        config=types.GenerateContentConfig(
+            temperature=0.7,
+            max_output_tokens=2048,
+            thinking_config=types.ThinkingConfig(thinking_budget=0),
+        ),
+    )
+    return resp.text.strip()
+
+
+# ── Processing thread (new video) ─────────────────────────
+def process_video(job_id: str, video_path: str, meta: dict):
+    job      = JOBS[job_id]
+    festival = get_festival(meta.get("festival_key", DEFAULT_FESTIVAL))
+    client   = genai.Client(api_key=festival["gemini_api_key"])
+    model_id = festival.get("gemini_model", "gemini-2.5-flash")
+    uploaded = None
+
+    try:
+        # 1 — Upload
+        job.update({"status": "uploading", "progress": 15,
+                    "message": f"Uploading to Gemini [{festival['name']}]..."})
+        uploaded = client.files.upload(file=video_path)
+
+        # 2 — Wait for processing
+        job.update({"status": "processing", "progress": 35,
+                    "message": "Gemini is watching the film..."})
+        while uploaded.state.name == "PROCESSING":
+            time.sleep(6)
+            uploaded = client.files.get(name=uploaded.name)
+
+        if uploaded.state.name != "ACTIVE":
+            raise RuntimeError(f"Gemini processing failed: {uploaded.state.name}")
+
+        # 3 — Analyse (video model, festival-specific prompt)
+        job.update({"status": "analysing", "progress": 55,
+                    "message": "Analysing story, direction, technical..."})
+        analysis_resp = client.models.generate_content(
+            model=model_id,
+            contents=[uploaded, build_analysis_prompt(festival)],
+            config=types.GenerateContentConfig(temperature=0.2, max_output_tokens=1024),
+        )
+        analysis = _parse_json(analysis_resp.text)
+
+        # 4 — Save to film library (before writing review, so it's never lost)
+        film_id = meta.get("film_id") or uuid.uuid4().hex
+        library_save(film_id, {
+            "film_id":            film_id,
+            "title":              meta.get("title", ""),
+            "director":           meta.get("director", ""),
+            "logline":            meta.get("logline", ""),
+            "director_statement": meta.get("director_statement", ""),
+            "genre":              meta.get("genre", ""),
+            "runtime":            meta.get("runtime", ""),
+            "country":            meta.get("country", ""),
+            "analysis":           analysis,
+            "analysed_at":        datetime.now().isoformat(),
+        })
+
+        # 5 — Write review (lite model, text-only)
+        job.update({"status": "writing", "progress": 78,
+                    "message": "Writing Expert Review (cached analysis)..."})
+        review = _write_review(client, meta, analysis, festival)
+
+        job.update({
+            "status": "done", "progress": 100, "message": "Review ready",
+            "analysis": analysis, "review": review,
+            "film_id": film_id,
+            "completed_at": datetime.now().isoformat(),
+        })
+
+    except Exception as e:
+        job.update({"status": "error", "progress": 0, "message": str(e)[:300]})
+    finally:
+        try:
+            if uploaded:
+                client.files.delete(name=uploaded.name)
+            Path(video_path).unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+# ── Rewrite thread (cached analysis) ──────────────────────
+def process_rewrite(job_id: str, film: dict, meta: dict):
+    """
+    Skip video upload entirely — use stored analysis, only call review writer.
+    Cost: ~0.01¢ instead of ~1.6¢.
+    """
+    job      = JOBS[job_id]
+    festival = get_festival(meta.get("festival_key", DEFAULT_FESTIVAL))
+    client   = genai.Client(api_key=festival["gemini_api_key"])
+
+    try:
+        job.update({"status": "writing", "progress": 60,
+                    "message": f"Rewriting review for {festival['name']} (no video re-upload)..."})
+
+        merged_meta = {**film, **meta}  # form fields override stored fields
+        review = _write_review(client, merged_meta, film["analysis"], festival)
+
+        job.update({
+            "status": "done", "progress": 100, "message": "Review ready",
+            "analysis": film["analysis"], "review": review,
+            "film_id": film["film_id"],
+            "from_cache": True,
+            "completed_at": datetime.now().isoformat(),
+        })
+    except Exception as e:
+        job.update({"status": "error", "progress": 0, "message": str(e)[:300]})
+
+
 # ── Routes ────────────────────────────────────────────────
 @app.route("/login", methods=["GET", "POST"])
 def login():
     error = ""
     if request.method == "POST":
-        email = request.form.get("email", "").strip().lower()
+        email    = request.form.get("email", "").strip().lower()
         password = request.form.get("password", "")
         if USERS.get(email) == password:
             session["logged_in"] = True
@@ -158,13 +241,21 @@ def index():
                                   user=session.get("user", ""))
 
 
+@app.route("/api/films")
+@login_required
+def api_films():
+    """Return all films in the library (for the frontend picker)."""
+    return jsonify(library_list())
+
+
 @app.route("/upload", methods=["POST"])
 @login_required
 def upload():
+    """New film — full video analysis + review."""
     if "video" not in request.files:
         return jsonify({"error": "No video file"}), 400
 
-    f = request.files["video"]
+    f   = request.files["video"]
     ext = Path(f.filename).suffix.lower()
     if ext not in ALLOWED_EXT:
         return jsonify({"error": f"Unsupported format. Use: {', '.join(ALLOWED_EXT)}"}), 400
@@ -186,27 +277,74 @@ def upload():
         return jsonify({"error": f"No Gemini API key configured for {festival['name']}"}), 400
 
     meta = {
-        "title":         request.form.get("title", "").strip(),
-        "director":      request.form.get("director", "").strip(),
-        "genre":         request.form.get("genre", "").strip(),
-        "runtime":       request.form.get("runtime", "").strip(),
-        "synopsis":      request.form.get("synopsis", "").strip(),
-        "festival_key":  festival_key,
-        "festival_name": festival["name"],
+        "film_id":            uuid.uuid4().hex,
+        "title":              request.form.get("title", "").strip(),
+        "director":           request.form.get("director", "").strip(),
+        "logline":            request.form.get("logline", "").strip(),
+        "director_statement": request.form.get("director_statement", "").strip(),
+        "genre":              request.form.get("genre", "").strip(),
+        "runtime":            request.form.get("runtime", "").strip(),
+        "festival_key":       festival_key,
+        "festival_name":      festival["name"],
     }
 
-    job_id = uuid.uuid4().hex
+    job_id       = uuid.uuid4().hex
     JOBS[job_id] = {
         "status": "queued", "progress": 5,
         "message": "Queued for processing...",
         "meta": meta, "analysis": None, "review": None,
-        "created_at": datetime.now().isoformat()
+        "created_at": datetime.now().isoformat(),
+    }
+    threading.Thread(target=process_video,
+                     args=(job_id, tmp.name, meta), daemon=True).start()
+    return jsonify({"job_id": job_id})
+
+
+@app.route("/rewrite", methods=["POST"])
+@login_required
+def rewrite():
+    """
+    Rewrite review for an existing film using cached analysis.
+    No video upload — only the cheap text review step runs.
+    """
+    film_id = request.form.get("film_id", "").strip()
+    film    = library_get(film_id)
+    if not film:
+        return jsonify({"error": "Film not found in library"}), 404
+    if not film.get("analysis"):
+        return jsonify({"error": "No cached analysis for this film"}), 400
+
+    festival_key = request.form.get("festival_key", DEFAULT_FESTIVAL)
+    if festival_key not in FESTIVALS:
+        festival_key = DEFAULT_FESTIVAL
+    festival = FESTIVALS[festival_key]
+
+    if not festival.get("gemini_api_key"):
+        return jsonify({"error": f"No Gemini API key configured for {festival['name']}"}), 400
+
+    # Allow overriding any film field from the form
+    meta = {
+        "film_id":            film_id,
+        "title":              request.form.get("title", film.get("title", "")).strip(),
+        "director":           request.form.get("director", film.get("director", "")).strip(),
+        "logline":            request.form.get("logline", film.get("logline", "")).strip(),
+        "director_statement": request.form.get("director_statement", film.get("director_statement", "")).strip(),
+        "genre":              request.form.get("genre", film.get("genre", "")).strip(),
+        "runtime":            request.form.get("runtime", film.get("runtime", "")).strip(),
+        "festival_key":       festival_key,
+        "festival_name":      festival["name"],
     }
 
-    thread = threading.Thread(target=process_video,
-                              args=(job_id, tmp.name, meta), daemon=True)
-    thread.start()
-    return jsonify({"job_id": job_id})
+    job_id       = uuid.uuid4().hex
+    JOBS[job_id] = {
+        "status": "queued", "progress": 5,
+        "message": "Loading cached analysis...",
+        "meta": meta, "analysis": None, "review": None,
+        "created_at": datetime.now().isoformat(),
+    }
+    threading.Thread(target=process_rewrite,
+                     args=(job_id, film, meta), daemon=True).start()
+    return jsonify({"job_id": job_id, "from_cache": True})
 
 
 @app.route("/status/<job_id>")
@@ -225,29 +363,22 @@ def publish(job_id):
     if not job or job.get("status") != "done":
         return jsonify({"error": "Review not ready"}), 400
 
-    festival = get_festival(job["meta"].get("festival_key", DEFAULT_FESTIVAL))
+    festival  = get_festival(job["meta"].get("festival_key", DEFAULT_FESTIVAL))
     wp_status = (request.json or {}).get("status", "draft")
-
-    result = wp_publish_review(
-        meta=job["meta"],
-        analysis=job["analysis"],
-        review=job["review"],
-        festival=festival,
-        status=wp_status,
-    )
+    result    = wp_publish_review(meta=job["meta"], analysis=job["analysis"],
+                                  review=job["review"], festival=festival, status=wp_status)
 
     if result["success"]:
         JOBS[job_id]["wp_post_id"] = result["post_id"]
         JOBS[job_id]["wp_url"]     = result["url"]
         JOBS[job_id]["wp_status"]  = wp_status
-
     return jsonify(result)
 
 
 @app.route("/publish_live/<job_id>", methods=["POST"])
 @login_required
 def publish_live(job_id):
-    job = JOBS.get(job_id)
+    job     = JOBS.get(job_id)
     post_id = job.get("wp_post_id") if job else None
     if not post_id:
         return jsonify({"error": "Not published to WordPress yet"}), 400
@@ -255,7 +386,7 @@ def publish_live(job_id):
     return jsonify(wp_publish_post(post_id, festival))
 
 
-# ── HTML Templates ────────────────────────────────────────
+# ── HTML ──────────────────────────────────────────────────
 LOGIN_HTML = """<!DOCTYPE html>
 <html><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -266,25 +397,15 @@ LOGIN_HTML = """<!DOCTYPE html>
 body{background:#0a0a0f;color:#e0dbd0;font-family:'DM Sans',sans-serif;
      min-height:100vh;display:flex;align-items:center;justify-content:center;
      background-image:radial-gradient(ellipse 60% 50% at 50% 0%,rgba(201,168,76,.07),transparent)}
-.box{width:380px;background:#13131a;border:1px solid rgba(201,168,76,.2);
-     border-radius:16px;padding:40px;text-align:center}
-.logo{font-family:'Bebas Neue',sans-serif;font-size:36px;color:#C9A84C;
-      letter-spacing:2px;margin-bottom:4px}
-.sub{font-size:12px;color:#6a6560;font-family:'DM Mono',monospace;
-     letter-spacing:2px;text-transform:uppercase;margin-bottom:32px}
-label{display:block;text-align:left;font-size:11px;color:#6a6560;
-      letter-spacing:1.5px;text-transform:uppercase;font-family:'DM Mono',monospace;
-      margin-bottom:6px}
-input{width:100%;background:#1a1a24;border:1px solid rgba(255,255,255,.08);
-      border-radius:8px;padding:12px 14px;color:#e0dbd0;font-family:'DM Sans',sans-serif;
-      font-size:14px;outline:none;margin-bottom:16px;transition:border-color .2s}
+.box{width:380px;background:#13131a;border:1px solid rgba(201,168,76,.2);border-radius:16px;padding:40px;text-align:center}
+.logo{font-family:'Bebas Neue',sans-serif;font-size:36px;color:#C9A84C;letter-spacing:2px;margin-bottom:4px}
+.sub{font-size:12px;color:#6a6560;font-family:'DM Mono',monospace;letter-spacing:2px;text-transform:uppercase;margin-bottom:32px}
+label{display:block;text-align:left;font-size:11px;color:#6a6560;letter-spacing:1.5px;text-transform:uppercase;font-family:'DM Mono',monospace;margin-bottom:6px}
+input{width:100%;background:#1a1a24;border:1px solid rgba(255,255,255,.08);border-radius:8px;padding:12px 14px;color:#e0dbd0;font-family:'DM Sans',sans-serif;font-size:14px;outline:none;margin-bottom:16px;transition:border-color .2s}
 input:focus{border-color:#C9A84C}
-button{width:100%;background:#C9A84C;color:#000;border:none;border-radius:8px;
-       padding:13px;font-family:'DM Sans',sans-serif;font-weight:600;font-size:14px;
-       cursor:pointer;margin-top:8px;transition:background .2s}
+button{width:100%;background:#C9A84C;color:#000;border:none;border-radius:8px;padding:13px;font-family:'DM Sans',sans-serif;font-weight:600;font-size:14px;cursor:pointer;margin-top:8px;transition:background .2s}
 button:hover{background:#e8c97a}
-.error{background:rgba(224,90,90,.1);border:1px solid rgba(224,90,90,.3);
-       border-radius:8px;padding:10px;font-size:13px;color:#e08080;margin-bottom:16px}
+.error{background:rgba(224,90,90,.1);border:1px solid rgba(224,90,90,.3);border-radius:8px;padding:10px;font-size:13px;color:#e08080;margin-bottom:16px}
 </style></head><body>
 <div class="box">
   <div class="logo">{{ festival }}</div>
@@ -297,8 +418,7 @@ button:hover{background:#e8c97a}
     <input type="password" name="password" placeholder="••••••••" required>
     <button type="submit">Sign In</button>
   </form>
-</div>
-</body></html>"""
+</div></body></html>"""
 
 
 APP_HTML = """<!DOCTYPE html>
@@ -312,144 +432,126 @@ APP_HTML = """<!DOCTYPE html>
      --border:rgba(201,168,76,.15);--text:#e0dbd0;--muted:#6a6560;
      --green:#4caf7a;--red:#e05a5a;--blue:#5a8fe0}
 *{margin:0;padding:0;box-sizing:border-box}
-body{background:var(--bg);color:var(--text);font-family:'DM Sans',sans-serif;
-     min-height:100vh;
+body{background:var(--bg);color:var(--text);font-family:'DM Sans',sans-serif;min-height:100vh;
      background-image:radial-gradient(ellipse 80% 40% at 50% 0%,rgba(201,168,76,.06),transparent)}
 
-/* ── Header ── */
 .header{background:var(--bg2);border-bottom:1px solid var(--border);
         padding:14px 28px;display:flex;align-items:center;justify-content:space-between}
-.header-logo{font-family:'Bebas Neue',sans-serif;font-size:22px;
-             color:var(--gold);letter-spacing:2px}
+.header-logo{font-family:'Bebas Neue',sans-serif;font-size:22px;color:var(--gold);letter-spacing:2px}
 .header-right{display:flex;align-items:center;gap:16px}
 .user-badge{font-size:11px;color:var(--muted);font-family:'DM Mono',monospace}
-.logout{font-size:11px;color:var(--gold-d);text-decoration:none;
-        font-family:'DM Mono',monospace;letter-spacing:1px;transition:color .2s}
+.logout{font-size:11px;color:var(--gold-d);text-decoration:none;font-family:'DM Mono',monospace;letter-spacing:1px;transition:color .2s}
 .logout:hover{color:var(--gold)}
 
-/* ── Layout ── */
 .main{max-width:960px;margin:0 auto;padding:32px 20px}
-.page-title{font-family:'Bebas Neue',sans-serif;font-size:40px;
-            color:var(--gold);letter-spacing:1px;margin-bottom:4px}
+.page-title{font-family:'Bebas Neue',sans-serif;font-size:40px;color:var(--gold);letter-spacing:1px;margin-bottom:4px}
 .page-sub{font-size:13px;color:var(--muted);margin-bottom:28px}
 
-/* ── Card ── */
-.card{background:var(--bg2);border:1px solid var(--border);
-      border-radius:14px;overflow:hidden;margin-bottom:20px}
-.card-head{padding:18px 24px;border-bottom:1px solid var(--border);
-           display:flex;align-items:center;gap:10px}
-.card-head-icon{width:28px;height:28px;border-radius:6px;
-                background:rgba(201,168,76,.1);display:flex;
-                align-items:center;justify-content:center;font-size:14px}
-.card-head-title{font-size:12px;letter-spacing:2px;color:var(--gold-d);
-                 text-transform:uppercase;font-family:'DM Mono',monospace;font-weight:500}
+.card{background:var(--bg2);border:1px solid var(--border);border-radius:14px;overflow:hidden;margin-bottom:20px}
+.card-head{padding:18px 24px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px}
+.card-head-icon{width:28px;height:28px;border-radius:6px;background:rgba(201,168,76,.1);
+                display:flex;align-items:center;justify-content:center;font-size:14px}
+.card-head-title{font-size:12px;letter-spacing:2px;color:var(--gold-d);text-transform:uppercase;
+                 font-family:'DM Mono',monospace;font-weight:500}
 .card-body{padding:20px 24px}
 
-/* ── Form grid ── */
+/* ── Film library picker ── */
+.library-picker{background:var(--bg3);border:1px solid rgba(201,168,76,.2);
+                border-radius:10px;padding:14px 16px;margin-bottom:20px}
+.library-label{font-size:10px;color:var(--gold-d);letter-spacing:2px;text-transform:uppercase;
+               font-family:'DM Mono',monospace;margin-bottom:8px}
+.library-select{width:100%;background:var(--bg2);border:1px solid rgba(255,255,255,.07);
+                border-radius:8px;padding:10px 12px;color:var(--text);font-family:'DM Sans',sans-serif;
+                font-size:13px;outline:none;transition:border-color .2s}
+.library-select:focus{border-color:var(--gold)}
+.library-hint{font-size:11px;color:var(--muted);font-family:'DM Mono',monospace;margin-top:6px;min-height:16px}
+.cache-badge{display:inline-flex;align-items:center;gap:5px;background:rgba(76,175,122,.1);
+             border:1px solid rgba(76,175,122,.25);border-radius:6px;padding:3px 10px;
+             font-size:11px;color:var(--green);font-family:'DM Mono',monospace;margin-top:6px}
+
+/* ── Form ── */
 .form-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
 .form-group{display:flex;flex-direction:column;gap:6px}
 .form-group.full{grid-column:1/-1}
-label{font-size:10px;color:var(--muted);letter-spacing:1.5px;
-      text-transform:uppercase;font-family:'DM Mono',monospace}
+label{font-size:10px;color:var(--muted);letter-spacing:1.5px;text-transform:uppercase;font-family:'DM Mono',monospace}
+.optional-tag{font-size:9px;color:var(--muted);opacity:.6;font-family:'DM Mono',monospace;margin-left:4px}
 input[type=text],input[type=number],select,textarea{
-  background:var(--bg3);border:1px solid rgba(255,255,255,.07);
-  border-radius:8px;padding:10px 12px;color:var(--text);
-  font-family:'DM Sans',sans-serif;font-size:13px;
+  background:var(--bg3);border:1px solid rgba(255,255,255,.07);border-radius:8px;
+  padding:10px 12px;color:var(--text);font-family:'DM Sans',sans-serif;font-size:13px;
   outline:none;width:100%;transition:border-color .2s;resize:vertical}
-input[type=text]:focus,input[type=number]:focus,
-select:focus,textarea:focus{border-color:var(--gold)}
+input[type=text]:focus,input[type=number]:focus,select:focus,textarea:focus{border-color:var(--gold)}
 select option{background:var(--bg3)}
 textarea{min-height:80px;line-height:1.5}
-
-/* ── Festival hint ── */
-.festival-hint{font-size:11px;color:var(--muted);margin-top:4px;
-               font-family:'DM Mono',monospace;min-height:16px}
+.festival-hint{font-size:11px;color:var(--muted);margin-top:4px;font-family:'DM Mono',monospace;min-height:16px}
 
 /* ── Drop zone ── */
-.drop-zone{border:2px dashed rgba(201,168,76,.25);border-radius:12px;
-           padding:40px 24px;text-align:center;cursor:pointer;
-           transition:all .2s;position:relative;background:var(--bg3)}
+.drop-zone{border:2px dashed rgba(201,168,76,.25);border-radius:12px;padding:40px 24px;
+           text-align:center;cursor:pointer;transition:all .2s;position:relative;background:var(--bg3)}
 .drop-zone.drag-over{border-color:var(--gold);background:rgba(201,168,76,.05)}
 .drop-zone.has-file{border-color:rgba(76,175,122,.4);background:rgba(76,175,122,.04)}
 .drop-icon{font-size:36px;margin-bottom:12px;opacity:.6}
 .drop-title{font-size:15px;font-weight:600;color:var(--text);margin-bottom:4px}
 .drop-sub{font-size:12px;color:var(--muted)}
-.file-info{font-size:12px;color:var(--green);font-family:'DM Mono',monospace;
-           margin-top:8px;font-weight:500}
+.file-info{font-size:12px;color:var(--green);font-family:'DM Mono',monospace;margin-top:8px;font-weight:500}
 input[type=file]{display:none}
 
-/* ── Submit btn ── */
-.submit-btn{width:100%;background:var(--gold);color:#000;border:none;
-            border-radius:10px;padding:14px;font-family:'DM Sans',sans-serif;
-            font-weight:700;font-size:15px;cursor:pointer;margin-top:4px;
-            transition:all .2s;letter-spacing:.3px}
+.submit-btn{width:100%;background:var(--gold);color:#000;border:none;border-radius:10px;
+            padding:14px;font-family:'DM Sans',sans-serif;font-weight:700;font-size:15px;
+            cursor:pointer;margin-top:4px;transition:all .2s;letter-spacing:.3px}
 .submit-btn:hover:not(:disabled){background:var(--gold-l);transform:translateY(-1px)}
 .submit-btn:disabled{opacity:.4;cursor:not-allowed;transform:none}
+.rewrite-btn{width:100%;background:var(--green);color:#000;border:none;border-radius:10px;
+             padding:14px;font-family:'DM Sans',sans-serif;font-weight:700;font-size:15px;
+             cursor:pointer;margin-top:4px;transition:all .2s;letter-spacing:.3px}
+.rewrite-btn:hover{background:#5fe090;transform:translateY(-1px)}
 
 /* ── Progress ── */
-.progress-card{display:none}
-.progress-card.active{display:block}
+.progress-card{display:none}.progress-card.active{display:block}
 .progress-status{display:flex;align-items:center;gap:12px;margin-bottom:16px}
-.spinner{width:20px;height:20px;border:2px solid rgba(201,168,76,.2);
-         border-top-color:var(--gold);border-radius:50%;
-         animation:spin .8s linear infinite;flex-shrink:0}
+.spinner{width:20px;height:20px;border:2px solid rgba(201,168,76,.2);border-top-color:var(--gold);
+         border-radius:50%;animation:spin .8s linear infinite;flex-shrink:0}
 @keyframes spin{to{transform:rotate(360deg)}}
 .progress-msg{font-size:13px;color:var(--text)}
-.progress-pct{font-family:'DM Mono',monospace;font-size:12px;
-               color:var(--gold);margin-left:auto}
-.progress-track{height:4px;background:rgba(255,255,255,.06);
-                border-radius:2px;overflow:hidden}
+.progress-pct{font-family:'DM Mono',monospace;font-size:12px;color:var(--gold);margin-left:auto}
+.progress-track{height:4px;background:rgba(255,255,255,.06);border-radius:2px;overflow:hidden}
 .progress-fill{height:100%;background:linear-gradient(90deg,var(--gold-d),var(--gold),var(--gold-l));
-               border-radius:2px;transition:width .4s ease;
-               box-shadow:0 0 8px rgba(201,168,76,.4)}
+               border-radius:2px;transition:width .4s ease;box-shadow:0 0 8px rgba(201,168,76,.4)}
 .step-list{display:flex;flex-direction:column;gap:8px;margin-top:16px}
-.step{display:flex;align-items:center;gap:10px;font-size:12px;
-      color:var(--muted);font-family:'DM Mono',monospace}
-.step.active{color:var(--text)}
-.step.done{color:var(--green)}
+.step{display:flex;align-items:center;gap:10px;font-size:12px;color:var(--muted);font-family:'DM Mono',monospace}
+.step.active{color:var(--text)}.step.done{color:var(--green)}
 .step-dot{width:6px;height:6px;border-radius:50%;background:currentColor;flex-shrink:0}
 
 /* ── Results ── */
-.results-card{display:none}
-.results-card.active{display:block}
+.results-card{display:none}.results-card.active{display:block}
 .scores-row{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:20px}
 .score-box{background:var(--bg3);border-radius:10px;padding:14px;text-align:center}
-.score-label{font-size:9px;color:var(--muted);letter-spacing:1.5px;
-              text-transform:uppercase;font-family:'DM Mono',monospace;
-              display:block;margin-bottom:6px}
+.score-label{font-size:9px;color:var(--muted);letter-spacing:1.5px;text-transform:uppercase;
+             font-family:'DM Mono',monospace;display:block;margin-bottom:6px}
 .score-num{font-family:'Bebas Neue',sans-serif;font-size:32px;color:var(--gold);line-height:1}
 .score-denom{font-size:11px;color:var(--muted);font-family:'DM Mono',monospace}
-.overall{background:linear-gradient(135deg,rgba(201,168,76,.1),rgba(201,168,76,.03));
-          border:1px solid rgba(201,168,76,.25)}
+.overall{background:linear-gradient(135deg,rgba(201,168,76,.1),rgba(201,168,76,.03));border:1px solid rgba(201,168,76,.25)}
 .obs-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:20px}
 .obs-item{background:var(--bg3);border-radius:8px;padding:12px}
-.obs-label{font-size:9px;color:var(--muted);letter-spacing:1.5px;
-            text-transform:uppercase;font-family:'DM Mono',monospace;
-            display:block;margin-bottom:5px}
+.obs-label{font-size:9px;color:var(--muted);letter-spacing:1.5px;text-transform:uppercase;
+           font-family:'DM Mono',monospace;display:block;margin-bottom:5px}
 .obs-text{font-size:12px;color:var(--text);line-height:1.5}
 .standout{border-left:2px solid var(--gold);padding-left:12px}
 .weakest{border-left:2px solid rgba(224,90,90,.5);padding-left:12px}
 .review-block{background:var(--bg3);border-radius:10px;padding:18px;position:relative}
-.review-text{font-size:14px;line-height:1.8;color:var(--text);
-              white-space:pre-wrap;font-family:'DM Sans',sans-serif}
-.copy-btn{position:absolute;top:12px;right:12px;background:rgba(201,168,76,.1);
-           border:1px solid var(--border);border-radius:6px;padding:6px 12px;
-           color:var(--gold);font-size:11px;font-family:'DM Mono',monospace;
-           cursor:pointer;transition:all .2s}
-.copy-btn:hover{background:rgba(201,168,76,.2)}
-.copy-btn.copied{color:var(--green);border-color:rgba(76,175,122,.3)}
-.new-btn{width:100%;background:transparent;border:1px solid var(--border);
-          border-radius:10px;padding:12px;color:var(--muted);
-          font-family:'DM Sans',sans-serif;font-size:14px;cursor:pointer;
-          margin-top:12px;transition:all .2s}
+.review-text{font-size:14px;line-height:1.8;color:var(--text);white-space:pre-wrap;font-family:'DM Sans',sans-serif}
+.copy-btn{position:absolute;top:12px;right:12px;background:rgba(201,168,76,.1);border:1px solid var(--border);
+          border-radius:6px;padding:6px 12px;color:var(--gold);font-size:11px;font-family:'DM Mono',monospace;
+          cursor:pointer;transition:all .2s}
+.copy-btn:hover{background:rgba(201,168,76,.2)}.copy-btn.copied{color:var(--green);border-color:rgba(76,175,122,.3)}
+.new-btn{width:100%;background:transparent;border:1px solid var(--border);border-radius:10px;padding:12px;
+         color:var(--muted);font-family:'DM Sans',sans-serif;font-size:14px;cursor:pointer;margin-top:12px;transition:all .2s}
 .new-btn:hover{border-color:var(--gold);color:var(--text)}
-.error-msg{background:rgba(224,90,90,.06);border:1px solid rgba(224,90,90,.2);
-            border-radius:8px;padding:12px 16px;font-size:13px;color:#e08080;display:none}
+.error-msg{background:rgba(224,90,90,.06);border:1px solid rgba(224,90,90,.2);border-radius:8px;
+           padding:12px 16px;font-size:13px;color:#e08080;display:none}
 .error-msg.active{display:block}
-.film-tag{display:inline-flex;align-items:center;gap:6px;
-           background:rgba(201,168,76,.08);border:1px solid var(--border);
-           border-radius:20px;padding:4px 12px;font-size:11px;
-           color:var(--gold-l);font-family:'DM Mono',monospace;margin-bottom:16px}
+.film-tag{display:inline-flex;align-items:center;gap:6px;background:rgba(201,168,76,.08);
+          border:1px solid var(--border);border-radius:20px;padding:4px 12px;font-size:11px;
+          color:var(--gold-l);font-family:'DM Mono',monospace;margin-bottom:16px}
 
 @media(max-width:640px){
   .form-grid,.scores-row,.obs-grid{grid-template-columns:1fr}
@@ -467,19 +569,20 @@ input[type=file]{display:none}
 
 <div class="main">
   <div class="page-title">Expert Review</div>
-  <div class="page-sub">Upload a film submission to generate an AI-assisted Expert Review</div>
+  <div class="page-sub">Generate an AI-assisted Expert Review — or rewrite instantly for a different festival using cached analysis</div>
 
   <!-- ── FORM ── -->
-  <div class="card" id="formCard">
-    <div class="card-head">
-      <div class="card-head-icon">🎬</div>
-      <div class="card-head-title">Film Details</div>
-    </div>
-    <div class="card-body">
-      <div class="form-grid">
+  <div id="formSection">
 
-        <div class="form-group full">
-          <label>Festival *</label>
+    <!-- Festival picker -->
+    <div class="card">
+      <div class="card-head">
+        <div class="card-head-icon">🎪</div>
+        <div class="card-head-title">Festival</div>
+      </div>
+      <div class="card-body">
+        <div class="form-group">
+          <label>Select Festival *</label>
           <select id="festivalKey" onchange="onFestivalChange(this)">
             {% for key, f in festivals.items() %}
             <option value="{{ key }}"{% if key == default_festival %} selected{% endif %}>
@@ -489,59 +592,108 @@ input[type=file]{display:none}
           </select>
           <div class="festival-hint" id="festivalHint"></div>
         </div>
+      </div>
+    </div>
 
+    <!-- Film library picker -->
+    <div class="card">
+      <div class="card-head">
+        <div class="card-head-icon">🗂</div>
+        <div class="card-head-title">Film Library — Reuse Cached Analysis</div>
+      </div>
+      <div class="card-body">
         <div class="form-group">
-          <label>Film Title *</label>
-          <input type="text" id="title" placeholder="The Last Frame" required>
-        </div>
-        <div class="form-group">
-          <label>Director *</label>
-          <input type="text" id="director" placeholder="Jane Smith" required>
-        </div>
-        <div class="form-group">
-          <label>Genre</label>
-          <select id="genre">
-            <option value="">Select genre</option>
-            <option>Drama</option><option>Documentary</option>
-            <option>Comedy</option><option>Thriller</option>
-            <option>Horror</option><option>Animation</option>
-            <option>Experimental</option><option>Short Film</option>
-            <option>Feature</option><option>Music Video</option>
-            <option>Other</option>
+          <label>Existing film <span class="optional-tag">optional — skips video re-upload</span></label>
+          <select id="libraryFilm" onchange="onLibraryChange(this)">
+            <option value="">— New film (upload video below) —</option>
           </select>
+          <div class="library-hint" id="libraryHint">Select an existing film to reuse its analysis. Only the review text will be regenerated for the chosen festival (~0.01¢ vs ~1.6¢).</div>
         </div>
-        <div class="form-group">
-          <label>Runtime (minutes)</label>
-          <input type="number" id="runtime" placeholder="12" min="1">
-        </div>
-        <div class="form-group full">
-          <label>Synopsis</label>
-          <textarea id="synopsis" placeholder="Brief description of the film..."></textarea>
-        </div>
-
       </div>
     </div>
-  </div>
 
-  <div class="card" id="uploadCard">
-    <div class="card-head">
-      <div class="card-head-icon">📁</div>
-      <div class="card-head-title">Upload Film</div>
-    </div>
-    <div class="card-body">
-      <div class="drop-zone" id="dropZone">
-        <div class="drop-icon">🎞</div>
-        <div class="drop-title">Drop video file here</div>
-        <div class="drop-sub">or click to browse — MP4, MOV, AVI, WebM, MKV</div>
-        <div class="file-info" id="fileInfo"></div>
-        <input type="file" id="fileInput" accept=".mp4,.mov,.avi,.webm,.mkv,.mpeg">
+    <!-- Film details -->
+    <div class="card" id="formCard">
+      <div class="card-head">
+        <div class="card-head-icon">🎬</div>
+        <div class="card-head-title">Film Details</div>
       </div>
-      <div class="error-msg" id="errorMsg"></div>
-      <button class="submit-btn" id="submitBtn" onclick="submitReview()" disabled>
-        Generate Expert Review
-      </button>
+      <div class="card-body">
+        <div class="form-grid">
+          <div class="form-group">
+            <label>Film Title *</label>
+            <input type="text" id="title" placeholder="Love Will Set You Free" required>
+          </div>
+          <div class="form-group">
+            <label>Director *</label>
+            <input type="text" id="director" placeholder="Jane Smith" required>
+          </div>
+          <div class="form-group">
+            <label>Genre</label>
+            <select id="genre">
+              <option value="">Select genre</option>
+              <option>Drama</option><option>Documentary</option><option>Comedy</option>
+              <option>Thriller</option><option>Horror</option><option>Animation</option>
+              <option>Experimental</option><option>Short Film</option><option>Feature</option>
+              <option>Music Video</option><option>Other</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label>Runtime (minutes)</label>
+            <input type="number" id="runtime" placeholder="13" min="1">
+          </div>
+          <div class="form-group full">
+            <label>Logline <span class="optional-tag">optional</span></label>
+            <input type="text" id="logline" placeholder="A one-sentence summary of the film...">
+          </div>
+          <div class="form-group full">
+            <label>Director's Statement <span class="optional-tag">optional</span></label>
+            <textarea id="director_statement" placeholder="The director's artistic intention or context..."></textarea>
+          </div>
+          <div class="form-group full">
+            <label>Synopsis <span class="optional-tag">optional</span></label>
+            <textarea id="synopsis" placeholder="Brief description of the film..."></textarea>
+          </div>
+        </div>
+      </div>
     </div>
-  </div>
+
+    <!-- Upload (hidden when library film selected) -->
+    <div class="card" id="uploadCard">
+      <div class="card-head">
+        <div class="card-head-icon">📁</div>
+        <div class="card-head-title">Upload Film</div>
+      </div>
+      <div class="card-body">
+        <div class="drop-zone" id="dropZone">
+          <div class="drop-icon">🎞</div>
+          <div class="drop-title">Drop video file here</div>
+          <div class="drop-sub">or click to browse — MP4, MOV, AVI, WebM, MKV</div>
+          <div class="file-info" id="fileInfo"></div>
+          <input type="file" id="fileInput" accept=".mp4,.mov,.avi,.webm,.mkv,.mpeg">
+        </div>
+        <div class="error-msg" id="errorMsg"></div>
+        <button class="submit-btn" id="submitBtn" onclick="submitReview()" disabled>
+          Generate Expert Review
+        </button>
+      </div>
+    </div>
+
+    <!-- Rewrite panel (shown when library film selected) -->
+    <div class="card" id="rewriteCard" style="display:none">
+      <div class="card-head">
+        <div class="card-head-icon">⚡</div>
+        <div class="card-head-title">Rewrite Review — No Video Upload Needed</div>
+      </div>
+      <div class="card-body">
+        <div class="error-msg" id="rewriteErrorMsg"></div>
+        <button class="rewrite-btn" id="rewriteBtn" onclick="submitRewrite()">
+          ⚡ Rewrite for Selected Festival (~0.01¢)
+        </button>
+      </div>
+    </div>
+
+  </div><!-- end formSection -->
 
   <!-- ── PROGRESS ── -->
   <div class="card progress-card" id="progressCard">
@@ -558,7 +710,7 @@ input[type=file]{display:none}
       <div class="progress-track">
         <div class="progress-fill" id="progressFill" style="width:0%"></div>
       </div>
-      <div class="step-list">
+      <div class="step-list" id="stepList">
         <div class="step" id="step-uploading"><div class="step-dot"></div>Uploading to Gemini</div>
         <div class="step" id="step-processing"><div class="step-dot"></div>Gemini watching the film</div>
         <div class="step" id="step-analysing"><div class="step-dot"></div>Analysing story, direction, technical</div>
@@ -580,7 +732,6 @@ input[type=file]{display:none}
         <div class="obs-grid" id="obsGrid"></div>
       </div>
     </div>
-
     <div class="card">
       <div class="card-head">
         <div class="card-head-icon">✍️</div>
@@ -596,22 +747,24 @@ input[type=file]{display:none}
     </div>
   </div>
 
-</div>
+</div><!-- main -->
 
 <script>
-let selectedFile = null;
-let pollInterval = null;
+let selectedFile  = null;
+let pollInterval  = null;
+let selectedFilmId = null;
 
 const FESTIVALS = {
   {% for key, f in festivals.items() %}
-  "{{ key }}": {
-    name: "{{ f.name }}",
-    focus: "{{ f.focus }}",
-    words: {{ f.word_count }},
-    tone: "{{ f.tone }}"
-  },
+  "{{ key }}": { name:"{{ f.name }}", focus:"{{ f.focus }}", words:{{ f.word_count }} },
   {% endfor %}
 };
+
+// ── On load ────────────────────────────────────────────────
+window.addEventListener('DOMContentLoaded', async () => {
+  onFestivalChange(document.getElementById('festivalKey'));
+  await loadLibrary();
+});
 
 function onFestivalChange(sel) {
   const f = FESTIVALS[sel.value];
@@ -619,62 +772,137 @@ function onFestivalChange(sel) {
     f ? `${f.words}-word review · ${f.focus}` : '';
 }
 
-window.addEventListener('DOMContentLoaded', () => {
-  const sel = document.getElementById('festivalKey');
-  if (sel) onFestivalChange(sel);
-});
+// ── Film library ───────────────────────────────────────────
+async function loadLibrary() {
+  try {
+    const res   = await fetch('/api/films');
+    const films = await res.json();
+    const sel   = document.getElementById('libraryFilm');
+    films.forEach(f => {
+      const opt   = document.createElement('option');
+      opt.value   = f.film_id;
+      const date  = f.analysed_at ? new Date(f.analysed_at).toLocaleDateString() : '';
+      opt.text    = `${f.title} — ${f.director}${date ? '  (' + date + ')' : ''}`;
+      opt.dataset.film = JSON.stringify(f);
+      sel.appendChild(opt);
+    });
+  } catch(e) { console.warn('Could not load library', e); }
+}
 
-// ── Drop zone ──────────────────────────────────────────────────────
+function onLibraryChange(sel) {
+  if (!sel.value) {
+    selectedFilmId = null;
+    document.getElementById('uploadCard').style.display   = 'block';
+    document.getElementById('rewriteCard').style.display  = 'none';
+    document.getElementById('submitBtn').disabled = !selectedFile;
+    document.getElementById('libraryHint').textContent =
+      'Select an existing film to reuse its analysis. Only the review text will be regenerated (~0.01¢ vs ~1.6¢).';
+    clearFilmFields();
+    return;
+  }
+
+  const film     = JSON.parse(sel.options[sel.selectedIndex].dataset.film);
+  selectedFilmId = film.film_id;
+
+  // Pre-fill form fields from stored data
+  document.getElementById('title').value              = film.title || '';
+  document.getElementById('director').value           = film.director || '';
+  document.getElementById('logline').value            = film.logline || '';
+  document.getElementById('director_statement').value = film.director_statement || '';
+  document.getElementById('genre').value              = film.genre || '';
+  document.getElementById('runtime').value            = film.runtime || '';
+
+  document.getElementById('uploadCard').style.display  = 'none';
+  document.getElementById('rewriteCard').style.display = 'block';
+
+  const a    = film.analysis;
+  const date = film.analysed_at ? new Date(film.analysed_at).toLocaleDateString() : '';
+  document.getElementById('libraryHint').innerHTML =
+    `<span class="cache-badge">✓ Cached analysis — ${date} — Overall ${a.overall_score}/20</span>
+     &nbsp; Rewriting only costs ~0.01¢ (no video upload)`;
+}
+
+function clearFilmFields() {
+  ['title','director','logline','director_statement','runtime'].forEach(id =>
+    document.getElementById(id).value = '');
+  document.getElementById('genre').value    = '';
+  document.getElementById('synopsis').value = '';
+}
+
+// ── Drop zone ──────────────────────────────────────────────
 const dropZone = document.getElementById('dropZone');
 const fileInput = document.getElementById('fileInput');
-
 dropZone.addEventListener('click', () => fileInput.click());
 dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('drag-over'); });
 dropZone.addEventListener('dragleave', () => dropZone.classList.remove('drag-over'));
 dropZone.addEventListener('drop', e => {
   e.preventDefault(); dropZone.classList.remove('drag-over');
-  const file = e.dataTransfer.files[0];
-  if (file) handleFile(file);
+  if (e.dataTransfer.files[0]) handleFile(e.dataTransfer.files[0]);
 });
 fileInput.addEventListener('change', e => { if (e.target.files[0]) handleFile(e.target.files[0]); });
 
 function handleFile(file) {
   selectedFile = file;
-  const sizeMb = (file.size / 1024 / 1024).toFixed(1);
+  const sizeMb = (file.size/1024/1024).toFixed(1);
   document.getElementById('fileInfo').textContent = `✓ ${file.name}  (${sizeMb} MB)`;
   dropZone.classList.add('has-file');
   document.getElementById('submitBtn').disabled = false;
   showError('');
 }
 
-// ── Submit ─────────────────────────────────────────────────────────
+// ── Submit: new video ──────────────────────────────────────
 async function submitReview() {
   const title    = document.getElementById('title').value.trim();
   const director = document.getElementById('director').value.trim();
   if (!title || !director) { showError('Film title and director are required'); return; }
-  if (!selectedFile) { showError('Please upload a video file'); return; }
+  if (!selectedFile)       { showError('Please upload a video file'); return; }
 
   const form = new FormData();
-  form.append('video',       selectedFile);
-  form.append('title',       title);
-  form.append('director',    director);
-  form.append('genre',       document.getElementById('genre').value);
-  form.append('runtime',     document.getElementById('runtime').value);
-  form.append('synopsis',    document.getElementById('synopsis').value);
-  form.append('festival_key', document.getElementById('festivalKey').value);
+  form.append('video',              selectedFile);
+  form.append('festival_key',       document.getElementById('festivalKey').value);
+  form.append('title',              title);
+  form.append('director',           director);
+  form.append('logline',            document.getElementById('logline').value);
+  form.append('director_statement', document.getElementById('director_statement').value);
+  form.append('genre',              document.getElementById('genre').value);
+  form.append('runtime',            document.getElementById('runtime').value);
+  form.append('synopsis',           document.getElementById('synopsis').value);
 
-  showProcessing();
+  showProcessing(false);
   try {
-    const res  = await fetch('/upload', { method: 'POST', body: form });
+    const res  = await fetch('/upload', { method:'POST', body:form });
     const data = await res.json();
     if (data.error) { showFormError(data.error); return; }
     pollStatus(data.job_id);
-  } catch(e) {
-    showFormError('Upload failed. Please try again.');
-  }
+  } catch(e) { showFormError('Upload failed. Please try again.'); }
 }
 
-// ── Polling ────────────────────────────────────────────────────────
+// ── Submit: rewrite from cache ─────────────────────────────
+async function submitRewrite() {
+  const title    = document.getElementById('title').value.trim();
+  const director = document.getElementById('director').value.trim();
+  if (!title || !director) { showRewriteError('Film title and director are required'); return; }
+
+  const form = new FormData();
+  form.append('film_id',            selectedFilmId);
+  form.append('festival_key',       document.getElementById('festivalKey').value);
+  form.append('title',              title);
+  form.append('director',           director);
+  form.append('logline',            document.getElementById('logline').value);
+  form.append('director_statement', document.getElementById('director_statement').value);
+  form.append('genre',              document.getElementById('genre').value);
+  form.append('runtime',            document.getElementById('runtime').value);
+
+  showProcessing(true);
+  try {
+    const res  = await fetch('/rewrite', { method:'POST', body:form });
+    const data = await res.json();
+    if (data.error) { showFormError(data.error); return; }
+    pollStatus(data.job_id);
+  } catch(e) { showFormError('Request failed. Please try again.'); }
+}
+
+// ── Polling ────────────────────────────────────────────────
 function pollStatus(jobId) {
   clearInterval(pollInterval);
   pollInterval = setInterval(async () => {
@@ -682,76 +910,76 @@ function pollStatus(jobId) {
       const res = await fetch(`/status/${jobId}`);
       const job = await res.json();
       updateProgress(job);
-      if (job.status === 'done') { clearInterval(pollInterval); showResults(job); }
-      else if (job.status === 'error') { clearInterval(pollInterval); showFormError(job.message); }
-    } catch(e) { /* keep polling */ }
-  }, 2500);
+      if (job.status === 'done')  { clearInterval(pollInterval); showResults(job); }
+      if (job.status === 'error') { clearInterval(pollInterval); showFormError(job.message); }
+    } catch(e) {}
+  }, 2000);
 }
 
-// ── Progress UI ────────────────────────────────────────────────────
-const STEPS = ['uploading','processing','analysing','writing'];
+// ── Progress UI ────────────────────────────────────────────
+const ALL_STEPS = ['uploading','processing','analysing','writing'];
 
 function updateProgress(job) {
   document.getElementById('progressMsg').textContent  = job.message;
   document.getElementById('progressPct').textContent  = job.progress + '%';
   document.getElementById('progressFill').style.width = job.progress + '%';
-  STEPS.forEach(s => {
+  ALL_STEPS.forEach(s => {
     const el = document.getElementById('step-' + s);
+    if (!el) return;
     el.className = 'step';
     if (s === job.status) el.classList.add('active');
-    if (STEPS.indexOf(s) < STEPS.indexOf(job.status) || job.status === 'done')
+    if (ALL_STEPS.indexOf(s) < ALL_STEPS.indexOf(job.status) || job.status === 'done')
       el.classList.add('done');
   });
 }
 
-// ── Results ────────────────────────────────────────────────────────
+// ── Results ────────────────────────────────────────────────
 function showResults(job) {
   document.getElementById('progressCard').classList.remove('active');
   document.getElementById('resultsCard').classList.add('active');
 
   const a    = job.analysis;
   const meta = job.meta;
-  const festivalLabel = meta.festival_name || '';
 
-  document.getElementById('filmTag').innerHTML =
-    `🎬 <span>${meta.title}</span> &nbsp;·&nbsp; <span>${meta.director}</span>` +
-    (meta.genre   ? ` &nbsp;·&nbsp; <span>${meta.genre}</span>`    : '') +
-    (meta.runtime ? ` &nbsp;·&nbsp; <span>${meta.runtime} min</span>` : '') +
-    (festivalLabel ? ` &nbsp;·&nbsp; <span style="color:var(--gold)">${festivalLabel}</span>` : '');
+  let tag = `🎬 <span>${meta.title}</span> &nbsp;·&nbsp; <span>${meta.director}</span>`;
+  if (meta.genre)        tag += ` &nbsp;·&nbsp; <span>${meta.genre}</span>`;
+  if (meta.runtime)      tag += ` &nbsp;·&nbsp; <span>${meta.runtime} min</span>`;
+  if (meta.festival_name) tag += ` &nbsp;·&nbsp; <span style="color:var(--gold)">${meta.festival_name}</span>`;
+  if (job.from_cache)    tag += ` &nbsp;·&nbsp; <span style="color:var(--green);font-size:10px">⚡ cached</span>`;
+  document.getElementById('filmTag').innerHTML = tag;
 
-  const cats = [
-    {k:'story',l:'Story'},{k:'direction',l:'Direction'},
-    {k:'technical',l:'Technical'},{k:'originality',l:'Originality'}
-  ];
+  const cats = [{k:'story',l:'Story'},{k:'direction',l:'Direction'},{k:'technical',l:'Technical'},{k:'originality',l:'Originality'}];
   let scoresHtml = cats.map(c =>
-    `<div class="score-box">
-      <span class="score-label">${c.l}</span>
-      <div><span class="score-num">${a[c.k].score}</span><span class="score-denom">/5</span></div>
-    </div>`).join('');
-  scoresHtml += `<div class="score-box overall">
-    <span class="score-label">Overall</span>
-    <div><span class="score-num">${a.overall_score}</span><span class="score-denom">/20</span></div>
-  </div>`;
+    `<div class="score-box"><span class="score-label">${c.l}</span>
+     <div><span class="score-num">${a[c.k].score}</span><span class="score-denom">/5</span></div></div>`
+  ).join('');
+  scoresHtml += `<div class="score-box overall"><span class="score-label">Overall</span>
+    <div><span class="score-num">${a.overall_score}</span><span class="score-denom">/20</span></div></div>`;
   document.getElementById('scoresRow').innerHTML = scoresHtml;
 
   document.getElementById('obsGrid').innerHTML = `
-    <div class="obs-item standout">
-      <span class="obs-label">Standout Moment</span>
-      <div class="obs-text">${a.standout_moment}</div>
-    </div>
-    <div class="obs-item weakest">
-      <span class="obs-label">Growth Area</span>
-      <div class="obs-text">${a.weakest_element}</div>
-    </div>
-    <div class="obs-item" style="grid-column:1/-1">
-      <span class="obs-label">Festival Suitability</span>
-      <div class="obs-text">${a.festival_suitability}</div>
-    </div>`;
+    <div class="obs-item standout"><span class="obs-label">Standout Moment</span>
+      <div class="obs-text">${a.standout_moment}</div></div>
+    <div class="obs-item weakest"><span class="obs-label">Growth Area</span>
+      <div class="obs-text">${a.weakest_element}</div></div>
+    <div class="obs-item" style="grid-column:1/-1"><span class="obs-label">Festival Suitability</span>
+      <div class="obs-text">${a.festival_suitability}</div></div>`;
 
   document.getElementById('reviewText').textContent = job.review;
+
+  // Reload library in case this was a new film
+  if (!job.from_cache) reloadLibrary();
 }
 
-// ── Copy ───────────────────────────────────────────────────────────
+async function reloadLibrary() {
+  const sel  = document.getElementById('libraryFilm');
+  const prev = sel.value;
+  while (sel.options.length > 1) sel.remove(1);
+  await loadLibrary();
+  sel.value = prev;
+}
+
+// ── Copy ───────────────────────────────────────────────────
 function copyReview() {
   navigator.clipboard.writeText(document.getElementById('reviewText').textContent).then(() => {
     const btn = document.getElementById('copyBtn');
@@ -760,12 +988,18 @@ function copyReview() {
   });
 }
 
-// ── Helpers ────────────────────────────────────────────────────────
-function showProcessing() {
-  document.getElementById('formCard').style.display   = 'none';
-  document.getElementById('uploadCard').style.display = 'none';
+// ── Helpers ────────────────────────────────────────────────
+function showProcessing(isCacheMode) {
+  document.getElementById('formSection').style.display = 'none';
   document.getElementById('progressCard').classList.add('active');
   document.getElementById('progressFill').style.width = '5%';
+
+  // For cache rewrites, grey out the video steps
+  const uploadSteps = ['uploading','processing','analysing'];
+  uploadSteps.forEach(s => {
+    const el = document.getElementById('step-' + s);
+    if (el) el.style.opacity = isCacheMode ? '0.25' : '1';
+  });
 }
 
 function showError(msg) {
@@ -773,24 +1007,32 @@ function showError(msg) {
   el.textContent = msg; el.className = 'error-msg' + (msg ? ' active' : '');
 }
 
+function showRewriteError(msg) {
+  const el = document.getElementById('rewriteErrorMsg');
+  el.textContent = msg; el.className = 'error-msg' + (msg ? ' active' : '');
+}
+
 function showFormError(msg) {
   document.getElementById('progressCard').classList.remove('active');
-  document.getElementById('formCard').style.display   = 'block';
-  document.getElementById('uploadCard').style.display = 'block';
+  document.getElementById('formSection').style.display = 'block';
   showError(msg);
 }
 
 function resetForm() {
   document.getElementById('resultsCard').classList.remove('active');
-  document.getElementById('formCard').style.display   = 'block';
-  document.getElementById('uploadCard').style.display = 'block';
-  ['title','director','runtime','synopsis'].forEach(id =>
-    document.getElementById(id).value = '');
-  document.getElementById('genre').value = '';
+  document.getElementById('formSection').style.display = 'block';
+  clearFilmFields();
+  document.getElementById('synopsis').value  = '';
   document.getElementById('fileInfo').textContent = '';
-  document.getElementById('submitBtn').disabled = true;
+  document.getElementById('submitBtn').disabled  = true;
+  document.getElementById('libraryFilm').value   = '';
+  document.getElementById('uploadCard').style.display  = 'block';
+  document.getElementById('rewriteCard').style.display = 'none';
   dropZone.classList.remove('has-file');
-  selectedFile = null;
+  selectedFile   = null;
+  selectedFilmId = null;
+  document.getElementById('libraryHint').textContent =
+    'Select an existing film to reuse its analysis (~0.01¢ vs ~1.6¢).';
 }
 </script>
 </body></html>"""

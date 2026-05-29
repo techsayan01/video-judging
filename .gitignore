@@ -2,4 +2,8 @@ venv/
 __pycache__/
 *.pyc
 downloads/
+film_library/
+frames/
+reviews_queue/
+approved_reviews/
 .env
