@@ -19,7 +19,10 @@ from datetime import datetime
 from config import DOWNLOADS_DIR, FRAMES_DIR, QUEUE_DIR, APPROVED_DIR, SHORT_FILM_MAX_MIN
 from festivals import FESTIVALS, DEFAULT_FESTIVAL, get_festival
 from downloader import download_screener, extract_keyframes, transcribe_audio
-from analyzer import analyse_film
+from analyzer import analyse_film, generate_expert_review
+import db
+
+db.init_db()
 
 os.makedirs(QUEUE_DIR, exist_ok=True)
 os.makedirs(APPROVED_DIR, exist_ok=True)
@@ -68,11 +71,16 @@ def submission_already_processed(entry_id: str, festival_key: str) -> bool:
 def process_submission(sub: dict, festival: dict) -> dict:
     """
     Full pipeline for one submission under a specific festival.
-    Returns the result dict saved to QUEUE_DIR.
+
+    Dedup strategy (cheapest first):
+      1. Queue/approved file already exists for this festival → skip entirely
+      2. Film found in DB by screener_url or title+director AND analysis exists
+         → skip video download + Gemini upload, regenerate review text only
+      3. Otherwise → full download + Gemini video analysis
     """
     festival_key = next(k for k, v in FESTIVALS.items() if v is festival)
     entry_id = sub.get("entry_id", "unknown")
-    title = sub.get("title", "Unknown Title")
+    title    = sub.get("title", "Unknown Title")
     print(f"\n[{festival['name']}][{entry_id}] Processing: {title}")
 
     if submission_already_processed(entry_id, festival_key):
@@ -83,6 +91,38 @@ def process_submission(sub: dict, festival: dict) -> dict:
         print(f"  [skip] No screener URL")
         return {"skipped": True, "entry_id": entry_id, "reason": "no screener"}
 
+    # ── DB dedup check ─────────────────────────────────────────────────────
+    existing = (
+        db.film_find_by_screener(sub.get("screener_url", "")) or
+        db.film_find_by_identity(sub.get("title", ""), sub.get("director", ""))
+    )
+
+    if existing and existing.get("analysis"):
+        film_id = existing["film_id"]
+        print(f"  [cache hit] Film in DB (id={film_id[:8]}) — skipping video upload")
+
+        # Check if a review for this festival already exists
+        existing_review = db.review_get(film_id, festival_key)
+        if existing_review and existing_review.get("review_text"):
+            print(f"  [cache hit] Review already exists for {festival['name']} — skipping entirely")
+            return save_to_queue(
+                entry_id=entry_id, film_meta=sub,
+                analysis=existing["analysis"],
+                review_draft=existing_review["review_text"],
+                festival_key=festival_key, festival_name=festival["name"],
+            )
+
+        # Regenerate review text only (no video)
+        print(f"  [rewrite] Generating review for {festival['name']} from cached analysis")
+        review_draft = generate_expert_review(sub, existing["analysis"], festival)
+        db.review_upsert(film_id, festival_key, review_draft)
+        return save_to_queue(
+            entry_id=entry_id, film_meta=sub,
+            analysis=existing["analysis"], review_draft=review_draft,
+            festival_key=festival_key, festival_name=festival["name"],
+        )
+
+    # ── Full analysis path ─────────────────────────────────────────────────
     dl = download_screener(
         screener_url=sub.get("screener_url", ""),
         password=sub.get("screener_password", ""),
@@ -94,15 +134,15 @@ def process_submission(sub: dict, festival: dict) -> dict:
                              festival_key=festival_key,
                              error=f"Download failed for {entry_id}")
 
-    video_path = dl["path"]
+    video_path   = dl["path"]
     duration_min = dl["duration_min"]
-    frame_paths = []
-    transcript = ""
+    frame_paths  = []
+    transcript   = ""
 
     if duration_min > SHORT_FILM_MAX_MIN:
         print(f"  [long film] {duration_min:.1f} min — extracting frames + transcript")
         frame_paths = extract_keyframes(video_path, entry_id)
-        transcript = transcribe_audio(video_path, entry_id)
+        transcript  = transcribe_audio(video_path, entry_id)
     else:
         print(f"  [short film] {duration_min:.1f} min — direct Gemini upload")
 
@@ -118,6 +158,24 @@ def process_submission(sub: dict, festival: dict) -> dict:
     if result["error"]:
         return save_to_queue(entry_id, sub, {}, "",
                              festival_key=festival_key, error=result["error"])
+
+    # Persist film + review to DB so future festivals can skip the video
+    film_id = existing["film_id"] if existing else None
+    if not film_id:
+        film_id = db.film_create({
+            "title":              sub.get("title", ""),
+            "director":           sub.get("director", ""),
+            "director_statement": sub.get("director_statement", ""),
+            "genre":              sub.get("genre", ""),
+            "runtime":            sub.get("runtime", ""),
+            "country":            sub.get("country", ""),
+            "screener_url":       sub.get("screener_url", ""),
+            "analysis":           result["analysis"],
+        })
+    else:
+        db.film_save_analysis(film_id, result["analysis"])
+
+    db.review_upsert(film_id, festival_key, result["review_draft"])
 
     return save_to_queue(
         entry_id=entry_id,

@@ -3,6 +3,7 @@ __pycache__/
 *.pyc
 downloads/
 film_library/
+film_judging.db
 frames/
 reviews_queue/
 approved_reviews/

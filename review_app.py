@@ -4,9 +4,11 @@ Run locally: python review_app.py
 Deploy:      docker build + gcloud run deploy
 
 Cost optimisations applied:
-  1. Film analysis cache — analysis JSON stored in film_library/ per film.
+  1. SQLite film library — analysis JSON stored in film_judging.db per film.
      Repeat reviews (same film, different festival) skip Gemini video upload
      entirely and only call the cheap text review-writing step (~0.01¢ vs ~1.6¢).
+     Dedup by screener URL or title+director — works across festivals and
+     across the batch pipeline (pipeline.py shares the same DB).
   2. Lite model for review writing — gemini-2.5-flash-lite used for the
      text-only review step (prose quality identical, ~70% cheaper output tokens).
   3. Thinking disabled on review call — gemini-2.5-flash thinking tokens
@@ -25,17 +27,17 @@ from dotenv import load_dotenv
 from festivals import FESTIVALS, DEFAULT_FESTIVAL, get_festival
 from prompts import build_analysis_prompt, build_review_prompt
 from wordpress import publish_review as wp_publish_review, publish_post as wp_publish_post
+import db
 
 load_dotenv()
 
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET", uuid.uuid4().hex)
+db.init_db()
 
 # ── Config ────────────────────────────────────────────────
 MAX_UPLOAD_MB  = 1800
 ALLOWED_EXT    = {".mp4", ".mov", ".avi", ".webm", ".mkv", ".mpeg"}
-FILM_LIBRARY   = Path("film_library")
-FILM_LIBRARY.mkdir(exist_ok=True)
 
 # Lite model used for text-only review writing (cheaper, same prose quality)
 REVIEW_MODEL = "gemini-2.5-flash-lite"
@@ -56,28 +58,6 @@ def login_required(f):
             return redirect("/login")
         return f(*args, **kwargs)
     return wrapper
-
-
-# ── Film Library ──────────────────────────────────────────
-def library_list() -> list[dict]:
-    films = []
-    for p in sorted(FILM_LIBRARY.glob("*.json"), key=lambda f: f.stat().st_mtime, reverse=True):
-        try:
-            films.append(json.loads(p.read_text()))
-        except Exception:
-            pass
-    return films
-
-
-def library_get(film_id: str) -> dict | None:
-    p = FILM_LIBRARY / f"{film_id}.json"
-    return json.loads(p.read_text()) if p.exists() else None
-
-
-def library_save(film_id: str, record: dict):
-    (FILM_LIBRARY / f"{film_id}.json").write_text(
-        json.dumps(record, indent=2, ensure_ascii=False)
-    )
 
 
 # ── Helpers ───────────────────────────────────────────────
@@ -142,25 +122,16 @@ def process_video(job_id: str, video_path: str, meta: dict):
         )
         analysis = _parse_json(analysis_resp.text)
 
-        # 4 — Save to film library (before writing review, so it's never lost)
+        # 4 — Save to DB (before writing review so analysis is never lost)
         film_id = meta.get("film_id") or uuid.uuid4().hex
-        library_save(film_id, {
-            "film_id":            film_id,
-            "title":              meta.get("title", ""),
-            "director":           meta.get("director", ""),
-            "logline":            meta.get("logline", ""),
-            "director_statement": meta.get("director_statement", ""),
-            "genre":              meta.get("genre", ""),
-            "runtime":            meta.get("runtime", ""),
-            "country":            meta.get("country", ""),
-            "analysis":           analysis,
-            "analysed_at":        datetime.now().isoformat(),
-        })
+        db.film_save_analysis(film_id, analysis)
+        db.film_update_meta(film_id, meta)
 
         # 5 — Write review (lite model, text-only)
         job.update({"status": "writing", "progress": 78,
                     "message": "Writing Expert Review (cached analysis)..."})
         review = _write_review(client, meta, analysis, festival)
+        db.review_upsert(film_id, meta.get("festival_key", DEFAULT_FESTIVAL), review)
 
         job.update({
             "status": "done", "progress": 100, "message": "Review ready",
@@ -196,6 +167,7 @@ def process_rewrite(job_id: str, film: dict, meta: dict):
 
         merged_meta = {**film, **meta}  # form fields override stored fields
         review = _write_review(client, merged_meta, film["analysis"], festival)
+        db.review_upsert(film["film_id"], meta.get("festival_key", DEFAULT_FESTIVAL), review)
 
         job.update({
             "status": "done", "progress": 100, "message": "Review ready",
@@ -244,14 +216,19 @@ def index():
 @app.route("/api/films")
 @login_required
 def api_films():
-    """Return all films in the library (for the frontend picker)."""
-    return jsonify(library_list())
+    """Return all films in the DB (for the frontend picker)."""
+    return jsonify(db.film_list())
 
 
 @app.route("/upload", methods=["POST"])
 @login_required
 def upload():
-    """New film — full video analysis + review."""
+    """New film — full video analysis + review.
+
+    Before touching the video, check if this film already exists in the DB
+    (by title+director). If it does, return a 'duplicate' signal so the
+    frontend can switch to the cheaper rewrite path instead.
+    """
     if "video" not in request.files:
         return jsonify({"error": "No video file"}), 400
 
@@ -259,6 +236,25 @@ def upload():
     ext = Path(f.filename).suffix.lower()
     if ext not in ALLOWED_EXT:
         return jsonify({"error": f"Unsupported format. Use: {', '.join(ALLOWED_EXT)}"}), 400
+
+    title    = request.form.get("title", "").strip()
+    director = request.form.get("director", "").strip()
+
+    # Dedup check — if this film is already in the library, skip video upload
+    existing = db.film_find_by_identity(title, director)
+    if existing and existing.get("analysis"):
+        return jsonify({
+            "duplicate": True,
+            "film_id":   existing["film_id"],
+            "title":     existing["title"],
+            "director":  existing["director"],
+            "analysed_at": existing.get("analysed_at", ""),
+            "message":   (
+                f'"{existing["title"]}" by {existing["director"]} is already in the film library '
+                f'(analysed {existing.get("analysed_at","")[:10]}). '
+                "Use the Rewrite path to generate a festival-specific review without re-uploading."
+            ),
+        }), 409
 
     tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
     f.save(tmp.name)
@@ -276,10 +272,23 @@ def upload():
         Path(tmp.name).unlink()
         return jsonify({"error": f"No Gemini API key configured for {festival['name']}"}), 400
 
+    # Create DB row now so analysis is persisted even if the job crashes mid-way
+    film_id = uuid.uuid4().hex
+    db.film_create({
+        "film_id":            film_id,
+        "title":              title,
+        "director":           director,
+        "logline":            request.form.get("logline", "").strip(),
+        "director_statement": request.form.get("director_statement", "").strip(),
+        "genre":              request.form.get("genre", "").strip(),
+        "runtime":            request.form.get("runtime", "").strip(),
+        "screener_url":       request.form.get("screener_url", "").strip(),
+    })
+
     meta = {
-        "film_id":            uuid.uuid4().hex,
-        "title":              request.form.get("title", "").strip(),
-        "director":           request.form.get("director", "").strip(),
+        "film_id":            film_id,
+        "title":              title,
+        "director":           director,
         "logline":            request.form.get("logline", "").strip(),
         "director_statement": request.form.get("director_statement", "").strip(),
         "genre":              request.form.get("genre", "").strip(),
@@ -308,7 +317,7 @@ def rewrite():
     No video upload — only the cheap text review step runs.
     """
     film_id = request.form.get("film_id", "").strip()
-    film    = library_get(film_id)
+    film    = db.film_get(film_id)
     if not film:
         return jsonify({"error": "Film not found in library"}), 404
     if not film.get("analysis"):
@@ -372,6 +381,10 @@ def publish(job_id):
         JOBS[job_id]["wp_post_id"] = result["post_id"]
         JOBS[job_id]["wp_url"]     = result["url"]
         JOBS[job_id]["wp_status"]  = wp_status
+        film_id = job["meta"].get("film_id")
+        if film_id:
+            db.review_set_wp(film_id, job["meta"].get("festival_key", DEFAULT_FESTIVAL),
+                             str(result["post_id"]), result["url"])
     return jsonify(result)
 
 
@@ -872,6 +885,22 @@ async function submitReview() {
   try {
     const res  = await fetch('/upload', { method:'POST', body:form });
     const data = await res.json();
+    if (res.status === 409 && data.duplicate) {
+      // Film already in library — offer to switch to rewrite mode
+      showFormError('');
+      document.getElementById('formSection').style.display = 'block';
+      document.getElementById('progressCard').classList.remove('active');
+      const sel = document.getElementById('libraryFilm');
+      // Find and select the matching option, or reload library then select
+      let found = false;
+      for (const opt of sel.options) {
+        if (opt.value === data.film_id) { sel.value = data.film_id; found = true; break; }
+      }
+      if (!found) { await reloadLibrary(); sel.value = data.film_id; }
+      onLibraryChange(sel);
+      showError(`"${data.title}" is already in the film library (analysed ${data.analysed_at ? data.analysed_at.slice(0,10) : ''}).\nSwitched to Rewrite mode — no video re-upload needed.`);
+      return;
+    }
     if (data.error) { showFormError(data.error); return; }
     pollStatus(data.job_id);
   } catch(e) { showFormError('Upload failed. Please try again.'); }
