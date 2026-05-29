@@ -187,9 +187,7 @@ def login():
             session["user"] = email
             return redirect("/")
         error = "Invalid credentials"
-    return render_template_string(LOGIN_HTML,
-                                  festival=FESTIVALS[DEFAULT_FESTIVAL]["name"],
-                                  error=error)
+    return render_template_string(LOGIN_HTML, error=error)
 
 
 @app.route("/logout")
@@ -398,7 +396,7 @@ def publish_live(job_id):
 LOGIN_HTML = """<!DOCTYPE html>
 <html><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{{ festival }} — Sign In</title>
+<title>Film Review Portal — Sign In</title>
 <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=DM+Sans:wght@300;400;500&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
@@ -416,8 +414,8 @@ button:hover{background:#e8c97a}
 .error{background:rgba(224,90,90,.1);border:1px solid rgba(224,90,90,.3);border-radius:8px;padding:10px;font-size:13px;color:#e08080;margin-bottom:16px}
 </style></head><body>
 <div class="box">
-  <div class="logo">{{ festival }}</div>
-  <div class="sub">Review Portal</div>
+  <div class="logo">Review Portal</div>
+  <div class="sub">Film Judging Platform</div>
   {% if error %}<div class="error">{{ error }}</div>{% endif %}
   <form method="POST">
     <label>Email</label>
@@ -568,7 +566,7 @@ input[type=file]{display:none}
 </style></head><body>
 
 <div class="header">
-  <div class="header-logo">{{ festival }}</div>
+  <div class="header-logo">Review Portal</div>
   <div class="header-right">
     <span class="user-badge">{{ user }}</span>
     <a href="/logout" class="logout">Sign out</a>
