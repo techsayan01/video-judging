@@ -1,226 +1,258 @@
 """
-db.py — SQLite central store for film analysis and reviews.
+db.py — MongoDB central store for films, reviews, and jobs.
 
-Schema
-------
-films   — one row per unique film; stores the Gemini analysis JSON so video
-           is never re-uploaded for a film that already exists in the library.
-reviews — one row per (film, festival) pair; lets the same film generate
-           reviews for multiple festivals without touching Gemini video again.
+Collections
+-----------
+films   — one row per unique film; Gemini analysis stored once so video is
+           never re-uploaded for repeat festival submissions.
+reviews — one document per (film_id, festival_key) pair.
+jobs    — transient processing state; replaces the in-memory JOBS dict so
+           Cloud Run instances share state across restarts and scale-outs.
 
-Deduplication strategy (in priority order)
-  1. screener_url match  — exact URL from FilmFreeway or manual entry
-  2. title + director    — normalised lowercase match
+TTL indexes (auto-purge — no manual cleanup needed)
+  films   → deleted after 365 days  (keeps DB under 512 MB M0 free tier)
+  reviews → deleted after 365 days
+  jobs    → deleted after 2 days    (transient, only needed during polling)
+
+Deduplication strategy (priority order)
+  1. screener_url exact match
+  2. title + director  (case-insensitive)
+
+Connection
+  Set MONGO_URI in .env — e.g.
+  MONGO_URI=mongodb+srv://user:pass@cluster.mongodb.net/film_judging?retryWrites=true&w=majority
 """
 
-import json
-import sqlite3
+import os
 import uuid
-from datetime import datetime
-from pathlib import Path
-from threading import Lock
+from datetime import datetime, timezone
+from pymongo import MongoClient, ASCENDING, DESCENDING
+from pymongo.errors import DuplicateKeyError
 
-DB_PATH = Path("film_judging.db")
-_lock = Lock()
+_client: MongoClient | None = None
+_db = None
+
+TTL_FILMS_DAYS = int(os.getenv("TTL_FILMS_DAYS", "365"))
+TTL_JOBS_DAYS  = int(os.getenv("TTL_JOBS_DAYS",  "2"))
 
 
-def _connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")   # allow concurrent reads
-    conn.execute("PRAGMA foreign_keys=ON")
-    return conn
+def _get_db():
+    global _client, _db
+    if _db is None:
+        uri    = os.getenv("MONGO_URI", "mongodb://localhost:27017/film_judging")
+        _client = MongoClient(uri)
+        _db     = _client.get_default_database() if "/" in uri.rsplit("@", 1)[-1] else _client["film_judging"]
+    return _db
 
 
 def init_db():
-    """Create tables if they don't exist. Call once at app startup."""
-    with _lock, _connect() as conn:
-        conn.executescript("""
-            CREATE TABLE IF NOT EXISTS films (
-                film_id            TEXT PRIMARY KEY,
-                title              TEXT NOT NULL,
-                director           TEXT NOT NULL,
-                logline            TEXT DEFAULT '',
-                director_statement TEXT DEFAULT '',
-                genre              TEXT DEFAULT '',
-                runtime            TEXT DEFAULT '',
-                country            TEXT DEFAULT '',
-                screener_url       TEXT DEFAULT '',
-                analysis           TEXT,
-                analysed_at        TEXT,
-                created_at         TEXT NOT NULL
-            );
+    """Create indexes. Safe to call multiple times (idempotent)."""
+    d = _get_db()
 
-            CREATE INDEX IF NOT EXISTS idx_films_screener
-                ON films(screener_url)
-                WHERE screener_url != '';
+    # ── films ──────────────────────────────────────────────────────────────
+    films = d["films"]
+    films.create_index("screener_url", sparse=True)
+    films.create_index([("title_lc", ASCENDING), ("director_lc", ASCENDING)])
+    films.create_index(
+        "created_at",
+        expireAfterSeconds=TTL_FILMS_DAYS * 86400,
+        name="ttl_films",
+    )
 
-            CREATE INDEX IF NOT EXISTS idx_films_identity
-                ON films(LOWER(title), LOWER(director));
+    # ── reviews ────────────────────────────────────────────────────────────
+    reviews = d["reviews"]
+    reviews.create_index(
+        [("film_id", ASCENDING), ("festival_key", ASCENDING)],
+        unique=True,
+        name="uniq_film_festival",
+    )
+    reviews.create_index("film_id")
+    reviews.create_index(
+        "created_at",
+        expireAfterSeconds=TTL_FILMS_DAYS * 86400,
+        name="ttl_reviews",
+    )
 
-            CREATE TABLE IF NOT EXISTS reviews (
-                id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                film_id      TEXT NOT NULL REFERENCES films(film_id) ON DELETE CASCADE,
-                festival_key TEXT NOT NULL,
-                review_text  TEXT DEFAULT '',
-                created_at   TEXT NOT NULL,
-                wp_post_id   TEXT DEFAULT '',
-                wp_url       TEXT DEFAULT '',
-                UNIQUE(film_id, festival_key)
-            );
+    # ── jobs ───────────────────────────────────────────────────────────────
+    jobs = d["jobs"]
+    jobs.create_index(
+        "created_at",
+        expireAfterSeconds=TTL_JOBS_DAYS * 86400,
+        name="ttl_jobs",
+    )
 
-            CREATE INDEX IF NOT EXISTS idx_reviews_film
-                ON reviews(film_id);
-        """)
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 # ── Film helpers ──────────────────────────────────────────────────────────────
 
-def _row_to_film(row) -> dict:
-    d = dict(row)
-    if d.get("analysis"):
-        try:
-            d["analysis"] = json.loads(d["analysis"])
-        except Exception:
-            d["analysis"] = {}
-    return d
+def _clean_film(doc: dict | None) -> dict | None:
+    if doc is None:
+        return None
+    doc = dict(doc)
+    doc.pop("_id", None)
+    doc.pop("title_lc", None)
+    doc.pop("director_lc", None)
+    # Convert datetime → ISO string for JSON serialisation
+    for k in ("created_at", "analysed_at"):
+        if isinstance(doc.get(k), datetime):
+            doc[k] = doc[k].isoformat()
+    return doc
 
 
 def film_list() -> list[dict]:
-    with _connect() as conn:
-        rows = conn.execute(
-            "SELECT * FROM films ORDER BY created_at DESC"
-        ).fetchall()
-    return [_row_to_film(r) for r in rows]
+    docs = _get_db()["films"].find({}, sort=[("created_at", DESCENDING)])
+    return [_clean_film(d) for d in docs]
 
 
 def film_get(film_id: str) -> dict | None:
-    with _connect() as conn:
-        row = conn.execute(
-            "SELECT * FROM films WHERE film_id = ?", (film_id,)
-        ).fetchone()
-    return _row_to_film(row) if row else None
+    return _clean_film(_get_db()["films"].find_one({"film_id": film_id}))
 
 
 def film_find_by_screener(screener_url: str) -> dict | None:
-    """Return existing film if the screener URL matches exactly."""
-    if not screener_url:
+    if not screener_url or not screener_url.strip():
         return None
-    with _connect() as conn:
-        row = conn.execute(
-            "SELECT * FROM films WHERE screener_url = ? LIMIT 1",
-            (screener_url.strip(),),
-        ).fetchone()
-    return _row_to_film(row) if row else None
+    return _clean_film(
+        _get_db()["films"].find_one({"screener_url": screener_url.strip()})
+    )
 
 
 def film_find_by_identity(title: str, director: str) -> dict | None:
-    """Return existing film by normalised title + director match."""
     if not title or not director:
         return None
-    with _connect() as conn:
-        row = conn.execute(
-            "SELECT * FROM films WHERE LOWER(title) = LOWER(?) AND LOWER(director) = LOWER(?) LIMIT 1",
-            (title.strip(), director.strip()),
-        ).fetchone()
-    return _row_to_film(row) if row else None
+    return _clean_film(
+        _get_db()["films"].find_one({
+            "title_lc":    title.strip().lower(),
+            "director_lc": director.strip().lower(),
+        })
+    )
 
 
 def film_create(data: dict) -> str:
-    """Insert a new film row. Returns the film_id."""
+    """Insert a new film document. Returns film_id."""
     film_id = data.get("film_id") or uuid.uuid4().hex
-    now = datetime.now().isoformat()
-    with _lock, _connect() as conn:
-        conn.execute(
-            """INSERT INTO films
-               (film_id, title, director, logline, director_statement,
-                genre, runtime, country, screener_url, analysis, analysed_at, created_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (
-                film_id,
-                data.get("title", ""),
-                data.get("director", ""),
-                data.get("logline", ""),
-                data.get("director_statement", ""),
-                data.get("genre", ""),
-                data.get("runtime", ""),
-                data.get("country", ""),
-                data.get("screener_url", ""),
-                json.dumps(data.get("analysis") or {}),
-                data.get("analysed_at", now),
-                now,
-            ),
-        )
+    now     = _now()
+    doc = {
+        "film_id":            film_id,
+        "title":              data.get("title", ""),
+        "director":           data.get("director", ""),
+        "title_lc":           data.get("title", "").strip().lower(),
+        "director_lc":        data.get("director", "").strip().lower(),
+        "logline":            data.get("logline", ""),
+        "director_statement": data.get("director_statement", ""),
+        "genre":              data.get("genre", ""),
+        "runtime":            data.get("runtime", ""),
+        "country":            data.get("country", ""),
+        "screener_url":       data.get("screener_url", ""),
+        "analysis":           data.get("analysis") or {},
+        "analysed_at":        None,
+        "created_at":         now,
+    }
+    _get_db()["films"].insert_one(doc)
     return film_id
 
 
 def film_save_analysis(film_id: str, analysis: dict):
-    """Write the Gemini analysis JSON into an existing film row."""
-    with _lock, _connect() as conn:
-        conn.execute(
-            "UPDATE films SET analysis = ?, analysed_at = ? WHERE film_id = ?",
-            (json.dumps(analysis), datetime.now().isoformat(), film_id),
-        )
+    """Write Gemini analysis into an existing film document."""
+    _get_db()["films"].update_one(
+        {"film_id": film_id},
+        {"$set": {"analysis": analysis, "analysed_at": _now()}},
+    )
 
 
 def film_update_meta(film_id: str, data: dict):
-    """Update editable metadata fields (logline, director_statement, etc.)."""
+    """Update editable metadata fields."""
     fields = ["logline", "director_statement", "genre", "runtime", "country", "screener_url"]
     updates = {k: data[k] for k in fields if k in data}
-    if not updates:
-        return
-    cols = ", ".join(f"{k} = ?" for k in updates)
-    with _lock, _connect() as conn:
-        conn.execute(
-            f"UPDATE films SET {cols} WHERE film_id = ?",
-            (*updates.values(), film_id),
-        )
+    if updates:
+        _get_db()["films"].update_one({"film_id": film_id}, {"$set": updates})
 
 
 # ── Review helpers ────────────────────────────────────────────────────────────
 
-def _row_to_review(row) -> dict:
-    return dict(row)
-
-
-def review_list_for_film(film_id: str) -> list[dict]:
-    with _connect() as conn:
-        rows = conn.execute(
-            "SELECT * FROM reviews WHERE film_id = ? ORDER BY created_at DESC",
-            (film_id,),
-        ).fetchall()
-    return [_row_to_review(r) for r in rows]
+def _clean_review(doc: dict | None) -> dict | None:
+    if doc is None:
+        return None
+    doc = dict(doc)
+    doc.pop("_id", None)
+    if isinstance(doc.get("created_at"), datetime):
+        doc["created_at"] = doc["created_at"].isoformat()
+    return doc
 
 
 def review_get(film_id: str, festival_key: str) -> dict | None:
-    with _connect() as conn:
-        row = conn.execute(
-            "SELECT * FROM reviews WHERE film_id = ? AND festival_key = ?",
-            (film_id, festival_key),
-        ).fetchone()
-    return _row_to_review(row) if row else None
-
-
-def review_upsert(film_id: str, festival_key: str, review_text: str) -> int:
-    """Insert or replace a review. Returns the row id."""
-    now = datetime.now().isoformat()
-    with _lock, _connect() as conn:
-        cur = conn.execute(
-            """INSERT INTO reviews (film_id, festival_key, review_text, created_at)
-               VALUES (?, ?, ?, ?)
-               ON CONFLICT(film_id, festival_key)
-               DO UPDATE SET review_text = excluded.review_text,
-                             created_at  = excluded.created_at""",
-            (film_id, festival_key, review_text, now),
+    return _clean_review(
+        _get_db()["reviews"].find_one(
+            {"film_id": film_id, "festival_key": festival_key}
         )
-    return cur.lastrowid
+    )
+
+
+def review_list_for_film(film_id: str) -> list[dict]:
+    docs = _get_db()["reviews"].find(
+        {"film_id": film_id}, sort=[("created_at", DESCENDING)]
+    )
+    return [_clean_review(d) for d in docs]
+
+
+def review_upsert(film_id: str, festival_key: str, review_text: str):
+    _get_db()["reviews"].update_one(
+        {"film_id": film_id, "festival_key": festival_key},
+        {"$set": {
+            "review_text":  review_text,
+            "created_at":   _now(),
+        }, "$setOnInsert": {
+            "wp_post_id": "",
+            "wp_url":     "",
+        }},
+        upsert=True,
+    )
 
 
 def review_set_wp(film_id: str, festival_key: str, post_id: str, url: str):
-    """Record WordPress publish details on an existing review row."""
-    with _lock, _connect() as conn:
-        conn.execute(
-            """UPDATE reviews SET wp_post_id = ?, wp_url = ?
-               WHERE film_id = ? AND festival_key = ?""",
-            (post_id, url, film_id, festival_key),
-        )
+    _get_db()["reviews"].update_one(
+        {"film_id": film_id, "festival_key": festival_key},
+        {"$set": {"wp_post_id": post_id, "wp_url": url}},
+    )
+
+
+# ── Job helpers (replaces in-memory JOBS dict) ────────────────────────────────
+
+def _clean_job(doc: dict | None) -> dict | None:
+    if doc is None:
+        return None
+    doc = dict(doc)
+    doc.pop("_id", None)
+    for k in ("created_at", "completed_at"):
+        if isinstance(doc.get(k), datetime):
+            doc[k] = doc[k].isoformat()
+    return doc
+
+
+def job_create(job_id: str, data: dict):
+    """Create a new job document."""
+    doc = {
+        "job_id":     job_id,
+        "created_at": _now(),
+        **data,
+    }
+    _get_db()["jobs"].insert_one(doc)
+
+
+def job_get(job_id: str) -> dict | None:
+    return _clean_job(_get_db()["jobs"].find_one({"job_id": job_id}))
+
+
+def job_update(job_id: str, updates: dict):
+    """Merge updates into an existing job document."""
+    if "completed_at" in updates and isinstance(updates["completed_at"], str):
+        try:
+            updates["completed_at"] = datetime.fromisoformat(updates["completed_at"])
+        except Exception:
+            pass
+    _get_db()["jobs"].update_one(
+        {"job_id": job_id},
+        {"$set": updates},
+    )

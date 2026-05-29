@@ -17,7 +17,7 @@ Cost optimisations applied:
 
 import os, json, uuid, threading, tempfile, time, re
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from functools import wraps
 from flask import Flask, request, jsonify, session, redirect, render_template_string
 from google import genai
@@ -46,8 +46,6 @@ USERS = {
     os.getenv("USER1_EMAIL", "employee1@elegantiff.com"): os.getenv("USER1_PASS", "change_me_1"),
     os.getenv("USER2_EMAIL", "employee2@elegantiff.com"): os.getenv("USER2_PASS", "change_me_2"),
 }
-
-JOBS: dict[str, dict] = {}
 
 
 # ── Auth ──────────────────────────────────────────────────
@@ -90,7 +88,6 @@ def _write_review(client: genai.Client, meta: dict,
 
 # ── Processing thread (new video) ─────────────────────────
 def process_video(job_id: str, video_path: str, meta: dict):
-    job      = JOBS[job_id]
     festival = get_festival(meta.get("festival_key", DEFAULT_FESTIVAL))
     client   = genai.Client(api_key=festival["gemini_api_key"])
     model_id = festival.get("gemini_model", "gemini-2.5-flash")
@@ -98,13 +95,13 @@ def process_video(job_id: str, video_path: str, meta: dict):
 
     try:
         # 1 — Upload
-        job.update({"status": "uploading", "progress": 15,
-                    "message": f"Uploading to Gemini [{festival['name']}]..."})
+        db.job_update(job_id, {"status": "uploading", "progress": 15,
+                                "message": f"Uploading to Gemini [{festival['name']}]..."})
         uploaded = client.files.upload(file=video_path)
 
         # 2 — Wait for processing
-        job.update({"status": "processing", "progress": 35,
-                    "message": "Gemini is watching the film..."})
+        db.job_update(job_id, {"status": "processing", "progress": 35,
+                                "message": "Gemini is watching the film..."})
         while uploaded.state.name == "PROCESSING":
             time.sleep(6)
             uploaded = client.files.get(name=uploaded.name)
@@ -113,8 +110,8 @@ def process_video(job_id: str, video_path: str, meta: dict):
             raise RuntimeError(f"Gemini processing failed: {uploaded.state.name}")
 
         # 3 — Analyse (video model, festival-specific prompt)
-        job.update({"status": "analysing", "progress": 55,
-                    "message": "Analysing story, direction, technical..."})
+        db.job_update(job_id, {"status": "analysing", "progress": 55,
+                                "message": "Analysing story, direction, technical..."})
         analysis_resp = client.models.generate_content(
             model=model_id,
             contents=[uploaded, build_analysis_prompt(festival)],
@@ -128,20 +125,20 @@ def process_video(job_id: str, video_path: str, meta: dict):
         db.film_update_meta(film_id, meta)
 
         # 5 — Write review (lite model, text-only)
-        job.update({"status": "writing", "progress": 78,
-                    "message": "Writing Expert Review (cached analysis)..."})
+        db.job_update(job_id, {"status": "writing", "progress": 78,
+                                "message": "Writing Expert Review (cached analysis)..."})
         review = _write_review(client, meta, analysis, festival)
         db.review_upsert(film_id, meta.get("festival_key", DEFAULT_FESTIVAL), review)
 
-        job.update({
+        db.job_update(job_id, {
             "status": "done", "progress": 100, "message": "Review ready",
             "analysis": analysis, "review": review,
             "film_id": film_id,
-            "completed_at": datetime.now().isoformat(),
+            "completed_at": datetime.now(timezone.utc),
         })
 
     except Exception as e:
-        job.update({"status": "error", "progress": 0, "message": str(e)[:300]})
+        db.job_update(job_id, {"status": "error", "progress": 0, "message": str(e)[:300]})
     finally:
         try:
             if uploaded:
@@ -157,27 +154,26 @@ def process_rewrite(job_id: str, film: dict, meta: dict):
     Skip video upload entirely — use stored analysis, only call review writer.
     Cost: ~0.01¢ instead of ~1.6¢.
     """
-    job      = JOBS[job_id]
     festival = get_festival(meta.get("festival_key", DEFAULT_FESTIVAL))
     client   = genai.Client(api_key=festival["gemini_api_key"])
 
     try:
-        job.update({"status": "writing", "progress": 60,
-                    "message": f"Rewriting review for {festival['name']} (no video re-upload)..."})
+        db.job_update(job_id, {"status": "writing", "progress": 60,
+                                "message": f"Rewriting review for {festival['name']} (no video re-upload)..."})
 
-        merged_meta = {**film, **meta}  # form fields override stored fields
+        merged_meta = {**film, **meta}
         review = _write_review(client, merged_meta, film["analysis"], festival)
         db.review_upsert(film["film_id"], meta.get("festival_key", DEFAULT_FESTIVAL), review)
 
-        job.update({
+        db.job_update(job_id, {
             "status": "done", "progress": 100, "message": "Review ready",
             "analysis": film["analysis"], "review": review,
             "film_id": film["film_id"],
             "from_cache": True,
-            "completed_at": datetime.now().isoformat(),
+            "completed_at": datetime.now(timezone.utc),
         })
     except Exception as e:
-        job.update({"status": "error", "progress": 0, "message": str(e)[:300]})
+        db.job_update(job_id, {"status": "error", "progress": 0, "message": str(e)[:300]})
 
 
 # ── Routes ────────────────────────────────────────────────
@@ -297,13 +293,12 @@ def upload():
         "festival_name":      festival["name"],
     }
 
-    job_id       = uuid.uuid4().hex
-    JOBS[job_id] = {
+    job_id = uuid.uuid4().hex
+    db.job_create(job_id, {
         "status": "queued", "progress": 5,
         "message": "Queued for processing...",
         "meta": meta, "analysis": None, "review": None,
-        "created_at": datetime.now().isoformat(),
-    }
+    })
     threading.Thread(target=process_video,
                      args=(job_id, tmp.name, meta), daemon=True).start()
     return jsonify({"job_id": job_id})
@@ -344,13 +339,12 @@ def rewrite():
         "festival_name":      festival["name"],
     }
 
-    job_id       = uuid.uuid4().hex
-    JOBS[job_id] = {
+    job_id = uuid.uuid4().hex
+    db.job_create(job_id, {
         "status": "queued", "progress": 5,
         "message": "Loading cached analysis...",
         "meta": meta, "analysis": None, "review": None,
-        "created_at": datetime.now().isoformat(),
-    }
+    })
     threading.Thread(target=process_rewrite,
                      args=(job_id, film, meta), daemon=True).start()
     return jsonify({"job_id": job_id, "from_cache": True})
@@ -359,7 +353,7 @@ def rewrite():
 @app.route("/status/<job_id>")
 @login_required
 def status(job_id):
-    job = JOBS.get(job_id)
+    job = db.job_get(job_id)
     if not job:
         return jsonify({"error": "Job not found"}), 404
     return jsonify(job)
@@ -368,7 +362,7 @@ def status(job_id):
 @app.route("/publish/<job_id>", methods=["POST"])
 @login_required
 def publish(job_id):
-    job = JOBS.get(job_id)
+    job = db.job_get(job_id)
     if not job or job.get("status") != "done":
         return jsonify({"error": "Review not ready"}), 400
 
@@ -378,9 +372,11 @@ def publish(job_id):
                                   review=job["review"], festival=festival, status=wp_status)
 
     if result["success"]:
-        JOBS[job_id]["wp_post_id"] = result["post_id"]
-        JOBS[job_id]["wp_url"]     = result["url"]
-        JOBS[job_id]["wp_status"]  = wp_status
+        db.job_update(job_id, {
+            "wp_post_id": str(result["post_id"]),
+            "wp_url":     result["url"],
+            "wp_status":  wp_status,
+        })
         film_id = job["meta"].get("film_id")
         if film_id:
             db.review_set_wp(film_id, job["meta"].get("festival_key", DEFAULT_FESTIVAL),
@@ -391,7 +387,7 @@ def publish(job_id):
 @app.route("/publish_live/<job_id>", methods=["POST"])
 @login_required
 def publish_live(job_id):
-    job     = JOBS.get(job_id)
+    job     = db.job_get(job_id)
     post_id = job.get("wp_post_id") if job else None
     if not post_id:
         return jsonify({"error": "Not published to WordPress yet"}), 400
