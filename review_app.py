@@ -9,7 +9,8 @@ from pathlib import Path
 from datetime import datetime
 from functools import wraps
 from flask import Flask, request, jsonify, session, redirect, render_template_string
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 from dotenv import load_dotenv
 
 from festivals import FESTIVALS, DEFAULT_FESTIVAL, get_festival
@@ -51,19 +52,21 @@ def process_video(job_id: str, video_path: str, meta: dict):
     uploaded_file = None
     festival = get_festival(meta.get("festival_key", DEFAULT_FESTIVAL))
 
+    client = genai.Client(api_key=festival["gemini_api_key"])
+    model_id = festival.get("gemini_model", "gemini-2.0-flash")
+    uploaded_file = None
     try:
         # Step 1: Upload to Gemini using festival's own API key
         job.update({"status": "uploading", "progress": 15,
                     "message": f"Uploading to Gemini [{festival['name']}]..."})
-        genai.configure(api_key=festival["gemini_api_key"])
-        uploaded_file = genai.upload_file(path=video_path, mime_type="video/mp4")
+        uploaded_file = client.files.upload(file=video_path)
 
         # Step 2: Wait for processing
         job.update({"status": "processing", "progress": 35,
                     "message": "Gemini is watching the film..."})
         while uploaded_file.state.name == "PROCESSING":
             time.sleep(6)
-            uploaded_file = genai.get_file(uploaded_file.name)
+            uploaded_file = client.files.get(name=uploaded_file.name)
 
         if uploaded_file.state.name != "ACTIVE":
             raise RuntimeError(f"Gemini processing failed: {uploaded_file.state.name}")
@@ -71,21 +74,20 @@ def process_video(job_id: str, video_path: str, meta: dict):
         # Step 3: Analyse using festival-specific judging prompt
         job.update({"status": "analysing", "progress": 55,
                     "message": "Analysing story, direction, technical..."})
-        model = genai.GenerativeModel(festival.get("gemini_model", "gemini-2.0-flash"))
-        analysis_resp = model.generate_content(
-            [uploaded_file, build_analysis_prompt(festival)],
-            generation_config=genai.types.GenerationConfig(
-                temperature=0.2, max_output_tokens=1024)
+        analysis_resp = client.models.generate_content(
+            model=model_id,
+            contents=[uploaded_file, build_analysis_prompt(festival)],
+            config=types.GenerateContentConfig(temperature=0.2, max_output_tokens=1024),
         )
         analysis = _parse_json(analysis_resp.text)
 
         # Step 4: Generate review using festival tone + guidelines
         job.update({"status": "writing", "progress": 78,
                     "message": "Writing Expert Review..."})
-        review_resp = model.generate_content(
-            build_review_prompt(meta, analysis, festival),
-            generation_config=genai.types.GenerationConfig(
-                temperature=0.7, max_output_tokens=800)
+        review_resp = client.models.generate_content(
+            model=model_id,
+            contents=build_review_prompt(meta, analysis, festival),
+            config=types.GenerateContentConfig(temperature=0.7, max_output_tokens=800),
         )
 
         job.update({
@@ -101,7 +103,7 @@ def process_video(job_id: str, video_path: str, meta: dict):
     finally:
         try:
             if uploaded_file:
-                genai.delete_file(uploaded_file.name)
+                client.files.delete(name=uploaded_file.name)
             Path(video_path).unlink(missing_ok=True)
         except Exception:
             pass
