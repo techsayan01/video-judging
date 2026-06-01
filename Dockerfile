@@ -1,11 +1,14 @@
 FROM python:3.11-slim
 
-RUN apt-get update && apt-get install -y \
-    ffmpeg wget curl \
+# Install system deps + yt-dlp + deno (needed by yt-dlp for YouTube JS challenge solving)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg wget curl unzip \
     && rm -rf /var/lib/apt/lists/* \
     && wget -qO /usr/local/bin/yt-dlp \
-       https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp \
-    && chmod +x /usr/local/bin/yt-dlp
+       https://github.com/yt-dlp/yt-dlp/releases/download/2026.03.17/yt-dlp \
+    && chmod +x /usr/local/bin/yt-dlp \
+    && curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh \
+    && deno --version
 
 WORKDIR /app
 COPY requirements.txt .
@@ -19,5 +22,5 @@ EXPOSE 8080
 CMD exec gunicorn --bind :$PORT \
     --workers 2 \
     --threads 8 \
-    --timeout 600 \
+    --timeout 3600 \
     review_app:app

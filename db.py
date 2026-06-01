@@ -44,7 +44,7 @@ def _get_db():
     if _db is None:
         uri     = os.getenv("MONGODB_URI") or os.getenv("MONGO_URI", "mongodb://localhost:27017/festival_reviewer")
         db_name = os.getenv("MONGO_DB_NAME", "")
-        _client = MongoClient(uri, serverSelectionTimeoutMS=5000)
+        _client = MongoClient(uri, serverSelectionTimeoutMS=5000, maxPoolSize=20)
         if db_name:
             _db = _client[db_name]
         elif "/" in uri.rsplit("@", 1)[-1]:
@@ -98,6 +98,18 @@ def _create_indexes(d):
     # ── festivals ──────────────────────────────────────────────────────────
     d["festivals"].create_index("key", unique=True, name="uniq_festival_key")
 
+    # ── seasons ────────────────────────────────────────────────────────────
+    seasons = d["seasons"]
+    seasons.create_index(
+        [("festival_key", ASCENDING), ("name", ASCENDING)],
+        unique=True,
+        name="uniq_festival_season",
+    )
+    seasons.create_index("festival_key")
+
+    # sessions collection — Flask-Session creates its own TTL index on "expiration"
+    # automatically; we must not create a duplicate here.
+
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
@@ -106,6 +118,17 @@ def _now() -> datetime:
 def init_db():
     """No-op kept for compatibility — indexes are created lazily on first _get_db() call."""
     pass
+
+
+def get_mongo_client() -> MongoClient:
+    """Return the shared MongoClient (initialised lazily). Used by Flask-Session."""
+    _get_db()          # ensure _client is initialised
+    return _client     # type: ignore[return-value]
+
+
+def get_db_name() -> str:
+    """Return the database name in use."""
+    return _get_db().name
 
 
 # ── Film helpers ──────────────────────────────────────────────────────────────
@@ -142,7 +165,10 @@ def film_find_by_screener(screener_url: str) -> dict | None:
 
 
 def film_find_by_identity(title: str, director: str, duration_min: float | None = None) -> dict | None:
-    """Match by title+director. If duration_min given, also require runtime within ±2 min."""
+    """Match by title+director. If duration_min given, also require runtime within ±2 min.
+    When several records share the same identity (e.g. earlier failed attempts that
+    never produced an analysis), prefer the one that actually has a cached analysis.
+    """
     if not title or not director:
         return None
     query: dict = {
@@ -151,7 +177,14 @@ def film_find_by_identity(title: str, director: str, duration_min: float | None 
     }
     if duration_min is not None:
         query["runtime_min"] = {"$gte": duration_min - 2, "$lte": duration_min + 2}
-    return _clean_film(_get_db()["films"].find_one(query))
+    # Prefer a record with a non-empty analysis; fall back to the most recent match
+    with_analysis = _get_db()["films"].find_one(
+        {**query, "analysis": {"$exists": True, "$nin": [None, {}]}},
+        sort=[("created_at", DESCENDING)],
+    )
+    if with_analysis:
+        return _clean_film(with_analysis)
+    return _clean_film(_get_db()["films"].find_one(query, sort=[("created_at", DESCENDING)]))
 
 
 def film_create(data: dict) -> str:
@@ -222,16 +255,47 @@ def review_list_for_film(film_id: str) -> list[dict]:
     return [_clean_review(d) for d in docs]
 
 
-def review_upsert(film_id: str, festival_key: str, review_text: str):
+def review_list_for_festival(festival_key: str, season: str = "", limit: int = 200) -> list[dict]:
+    """Return all reviews for a festival (optionally filtered by season), newest first, joined with film metadata."""
+    query: dict = {"festival_key": festival_key}
+    if season:
+        query["season"] = season
+    reviews = list(_get_db()["reviews"].find(
+        query,
+        sort=[("created_at", DESCENDING)],
+        limit=limit,
+    ))
+    if not reviews:
+        return []
+    film_ids = [r["film_id"] for r in reviews]
+    films = {
+        f["film_id"]: f
+        for f in _get_db()["films"].find({"film_id": {"$in": film_ids}})
+    }
+    result = []
+    for r in reviews:
+        r = _clean_review(r)
+        film = films.get(r["film_id"], {})
+        r["title"]     = film.get("title", "—")
+        r["director"]  = film.get("director", "—")
+        r["genre"]     = film.get("genre", "")
+        r["runtime"]   = film.get("runtime", "")
+        r["country"]   = film.get("country", "")
+        result.append(r)
+    return result
+
+
+def review_upsert(film_id: str, festival_key: str, review_text: str, season: str = "", overall_rating: float | None = None):
+    updates: dict = {
+        "review_text": review_text,
+        "season":      season,
+        "created_at":  _now(),
+    }
+    if overall_rating is not None:
+        updates["overall_rating"] = overall_rating
     _get_db()["reviews"].update_one(
         {"film_id": film_id, "festival_key": festival_key},
-        {"$set": {
-            "review_text":  review_text,
-            "created_at":   _now(),
-        }, "$setOnInsert": {
-            "wp_post_id": "",
-            "wp_url":     "",
-        }},
+        {"$set": updates, "$setOnInsert": {"wp_post_id": "", "wp_url": ""}},
         upsert=True,
     )
 
@@ -277,6 +341,7 @@ def job_update(job_id: str, updates: dict):
             updates["completed_at"] = datetime.fromisoformat(updates["completed_at"])
         except Exception:
             pass
+    updates.setdefault("updated_at", _now())   # always stamp last-modified time
     _get_db()["jobs"].update_one(
         {"job_id": job_id},
         {"$set": updates},
@@ -328,6 +393,15 @@ def user_create(email: str, password_hash: str, role: str = "user", festival_key
         return False
 
 
+def user_update_password(email: str, password_hash: str) -> bool:
+    """Update a user's password hash. Returns False if not found."""
+    result = _get_db()["users"].update_one(
+        {"email": email.strip().lower()},
+        {"$set": {"password_hash": password_hash}}
+    )
+    return result.matched_count > 0
+
+
 def user_delete(email: str) -> bool:
     """Delete a user by email. Returns False if not found."""
     result = _get_db()["users"].delete_one({"email": email.strip().lower()})
@@ -376,3 +450,106 @@ def festival_delete(key: str) -> bool:
 
 def festival_count() -> int:
     return _get_db()["festivals"].count_documents({})
+
+
+# ── Season helpers ────────────────────────────────────────────────────────────
+
+def season_list(festival_key: str) -> list[dict]:
+    docs = _get_db()["seasons"].find(
+        {"festival_key": festival_key},
+        sort=[("name", ASCENDING)],
+    )
+    return [{"name": d["name"], "festival_key": d["festival_key"]} for d in docs]
+
+
+def season_create(festival_key: str, name: str) -> bool:
+    """Add a season. Returns False if it already exists."""
+    try:
+        _get_db()["seasons"].insert_one({
+            "festival_key": festival_key,
+            "name":         name.strip(),
+            "created_at":   _now(),
+        })
+        return True
+    except Exception:
+        return False
+
+
+def season_delete(festival_key: str, name: str) -> bool:
+    result = _get_db()["seasons"].delete_one({"festival_key": festival_key, "name": name.strip()})
+    return result.deleted_count > 0
+
+
+def season_rename(festival_key: str, old_name: str, new_name: str) -> bool:
+    result = _get_db()["seasons"].update_one(
+        {"festival_key": festival_key, "name": old_name.strip()},
+        {"$set": {"name": new_name.strip()}},
+    )
+    return result.matched_count > 0
+
+
+# ── Category helpers (stored in festival document) ────────────────────────────
+
+def category_list(festival_key: str) -> list[str]:
+    doc = festival_get(festival_key)
+    return doc.get("categories", []) if doc else []
+
+
+def category_add(festival_key: str, name: str) -> bool:
+    name = name.strip()
+    if not name:
+        return False
+    result = _get_db()["festivals"].update_one(
+        {"key": festival_key, "categories": {"$ne": name}},
+        {"$push": {"categories": name}},
+    )
+    return result.modified_count > 0
+
+
+def category_delete(festival_key: str, name: str) -> bool:
+    name = name.strip()
+    result = _get_db()["festivals"].update_one(
+        {"key": festival_key},
+        # also drop any per-category prompt stored for this category
+        {"$pull": {"categories": name}, "$unset": {f"category_prompts.{name}": ""}},
+    )
+    return result.modified_count > 0
+
+
+def category_rename(festival_key: str, old_name: str, new_name: str) -> bool:
+    old_name = old_name.strip()
+    new_name = new_name.strip()
+    doc = festival_get(festival_key)
+    if not doc:
+        return False
+    cats = doc.get("categories", [])
+    if old_name not in cats or new_name in cats:
+        return False
+    cats = [new_name if c == old_name else c for c in cats]
+    # Carry the per-category prompt across the rename
+    prompts = doc.get("category_prompts", {}) or {}
+    if old_name in prompts:
+        prompts[new_name] = prompts.pop(old_name)
+    result = _get_db()["festivals"].update_one(
+        {"key": festival_key},
+        {"$set": {"categories": cats, "category_prompts": prompts}},
+    )
+    return result.modified_count > 0
+
+
+def category_get_prompt(festival_key: str, name: str) -> str:
+    """Return the per-category judging emphasis for a category, or '' if none set."""
+    doc = festival_get(festival_key)
+    if not doc:
+        return ""
+    return (doc.get("category_prompts", {}) or {}).get(name.strip(), "")
+
+
+def category_set_prompt(festival_key: str, name: str, prompt: str) -> bool:
+    """Set (or clear) the per-category judging emphasis for a category."""
+    name = name.strip()
+    result = _get_db()["festivals"].update_one(
+        {"key": festival_key, "categories": name},   # only if the category exists
+        {"$set": {f"category_prompts.{name}": prompt}},
+    )
+    return result.matched_count > 0

@@ -16,8 +16,11 @@ GEMINI_MODEL     = "gemini-2.5-flash"
 GEMINI_MODEL_PRO = "gemini-1.5-pro"
 
 # ── Film length thresholds ────────────────────────────────────────────────────
-SHORT_FILM_MAX_MIN  = 40       # under 40 min → direct Gemini video upload
-LONG_FILM_FRAME_FPS = "1/10"  # 1 keyframe every 10s for features
+DIRECT_UPLOAD_MAX_MIN = 120    # ≤ 120 min → direct Gemini Files API upload
+FEATURE_MIN           = 120    # > 120 min → GCS gs:// URI (or chunked keyframes fallback)
+LONG_FILM_FRAME_FPS   = "1/10" # 1 keyframe every 10s for chunked fallback
+CHUNK_FRAMES          = 80     # max frames per Gemini call in chunked mode
+SHORT_FILM_MAX_MIN    = 40     # kept for backward compat with analyzer.py
 
 # ── Upload limits ─────────────────────────────────────────────────────────────
 MAX_UPLOAD_MB = 1800           # stay under 2 GB Gemini limit

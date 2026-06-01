@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "festival-review-app",
+      "runtimeExecutable": "/Users/techsayan/Documents/GitHub/video-judging/venv/bin/python",
+      "runtimeArgs": ["review_app.py"],
+      "port": 8080
+    }
+  ]
+}
