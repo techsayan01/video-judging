@@ -115,11 +115,19 @@ MAX_FIELD_LEN  = 500
 MAX_TEXTAREA_LEN = 5000
 
 # Safety settings for film analysis — Gemini's defaults (BLOCK_MEDIUM_AND_ABOVE)
-# are too aggressive for legitimate cinema: horror, thriller, drama, and war films
-# all contain violence, mature themes, and strong language that can trigger blocks.
-# We use BLOCK_ONLY_HIGH so the model can analyse real film content without false
-# positives, while still blocking genuinely harmful material.
+# are too aggressive for legitimate cinema: horror, body-horror, thriller, drama,
+# and experimental films trigger BlockedReason.OTHER even at BLOCK_ONLY_HIGH.
+# BLOCK_NONE is required for the analysis pass so Gemini can watch and critique
+# real film content (horror, violence, dark themes) without false-positive blocks.
+# The review-writing pass keeps BLOCK_ONLY_HIGH as it generates new text.
 _FILM_SAFETY = [
+    types.SafetySetting(category="HARM_CATEGORY_HARASSMENT",        threshold="BLOCK_NONE"),
+    types.SafetySetting(category="HARM_CATEGORY_HATE_SPEECH",       threshold="BLOCK_NONE"),
+    types.SafetySetting(category="HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold="BLOCK_NONE"),
+    types.SafetySetting(category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="BLOCK_NONE"),
+]
+
+_REVIEW_SAFETY = [
     types.SafetySetting(category="HARM_CATEGORY_HARASSMENT",        threshold="BLOCK_ONLY_HIGH"),
     types.SafetySetting(category="HARM_CATEGORY_HATE_SPEECH",       threshold="BLOCK_ONLY_HIGH"),
     types.SafetySetting(category="HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold="BLOCK_ONLY_HIGH"),
@@ -170,55 +178,48 @@ def _extract_overall_rating(review_text: str) -> float | None:
 
 
 DEFAULT_REVIEW_PROMPT = """\
-You are writing as a seasoned festival programmer and working filmmaker who has
-sat on many juries and mentored emerging directors. Your job is to give feedback
-that a filmmaker will find genuinely useful AND genuinely encouraging — the kind
-of note that makes them want to keep going, not give up. Remember: every filmmaker
-is emotionally invested in their film. Be honest about weaknesses, but never brutal
-or dismissive. Frame every criticism as a path forward, not a verdict.
+Write as a professional film critic and seasoned festival juror — the depth and
+specificity of a published reviewer, but encouraging and constructive in tone. Every
+filmmaker is emotionally invested in their work: be honest about weaknesses while
+framing each as a path forward, never brutal or dismissive.
 
-Write the review in the following structure:
+Produce the review in EXACTLY this structure and order:
 
 Overall Rating: [X]/10
 
 Ratings:
-- Concept / Originality: [0–10]
-- Structure: [0–10]
-- Plot: [0–10]
+- Originality / Creativity: [0–10]
+- Direction: [0–10]
+- Writing: [0–10]
+- Cinematography: [0–10]
+- Performances: [0–10]
+- Production Value: [0–10]
 - Pacing: [0–10]
-- Characters: [0–10]
-- Dialogue: [0–10]
-- Average: [mean of the six scores above, one decimal place]
+- Structure: [0–10]
+- Sound / Music: [0–10]
+- Average: [mean of the nine scores above, one decimal place]
 
 Comments:
-[A warm, specific, and craft-literate critique. Lead with what genuinely works and
-why it works — name the exact scene, performance, cut, or image. Then move into
-growth areas framed constructively ("the second act could breathe more if…",
-"consider holding that final shot a beat longer…"). Where it helps, draw on
-professional craft wisdom or a brief anecdote from the filmmaking world (e.g. how
-editors approach pacing, how directors stage a reveal, a technique a known film used
-well) to illustrate your point — but keep anecdotes short and relevant, never
-name-dropping for its own sake. Speak to the filmmaker directly and respectfully,
-as a peer who wants them to succeed.]
+[A deep, professional critique. Lead with what genuinely works and why — name the exact
+scene, shot, performance, cut, or sound cue (with timestamps where possible). Then move
+into growth areas framed constructively, each paired with a concrete, actionable
+suggestion. Address the dimensions that matter most for this particular film with real
+critical insight, not surface praise. Where it illuminates a point, draw briefly on
+professional craft wisdom. Speak to the filmmaker directly and respectfully, as a peer
+who wants them to succeed.]
 
 Recommendation: [Pass | Recommend | Award Worthy | Maybe]
-Reason: [One encouraging sentence justifying your recommendation — even a "Pass"
-should leave the filmmaker with a constructive takeaway.]
-
-Recommendation must align with the Overall Rating:
-- 8.5–10  → Award Worthy
-- 7.0–8.4 → Recommend
-- 5.0–6.9 → Maybe
-- below 5 → Pass
-Do not label a film "Award Worthy" or "Recommend" unless its Overall Rating earns it.
+Reason: [One encouraging sentence justifying the recommendation.]
 
 Rules:
-- All scores must be integers between 0 and 10.
-- The Average must be the mathematical mean of the six category scores.
+- All nine scores are integers 0–10; the Average is their arithmetic mean (one decimal).
+- Recommendation must align with the Overall Rating: 8.5–10 → Award Worthy,
+  7.0–8.4 → Recommend, 5.0–6.9 → Maybe, below 5 → Pass.
 - Recommendation must be exactly one of: Pass, Recommend, Award Worthy, Maybe.
 - Do not add extra sections or headings beyond those listed above.
-- Never be harsh, sarcastic, or dismissive. Critique the work, never the filmmaker.
-- Every weakness you raise must be paired with a concrete, actionable suggestion.\
+- For a film category that has no dialogue, performers, or score, judge the nearest
+  equivalent craft fairly rather than scoring it zero.
+- Never be harsh, sarcastic, or dismissive. Critique the work, never the filmmaker.\
 """
 
 
@@ -413,7 +414,20 @@ def _parse_json(raw: str) -> dict:
         start = clean.find("{")
         end   = clean.rfind("}")
         if start != -1 and end > start:
-            return json.loads(clean[start:end + 1])
+            try:
+                return json.loads(clean[start:end + 1])
+            except json.JSONDecodeError:
+                pass
+        # Final fallback: auto-repair internally malformed JSON (unescaped quotes,
+        # trailing commas, truncated strings) that Gemini occasionally produces.
+        try:
+            from json_repair import repair_json
+            repaired = repair_json(clean[start:end + 1] if start != -1 and end > start else clean)
+            result = json.loads(repaired)
+            logging.warning("[_parse_json] JSON repaired automatically — Gemini returned malformed JSON")
+            return result
+        except Exception:
+            pass
         raise
 
 
@@ -427,7 +441,7 @@ def _write_review(client: genai.Client, meta: dict,
             temperature=0.7,
             max_output_tokens=2048,
             thinking_config=types.ThinkingConfig(thinking_budget=0),
-            safety_settings=_FILM_SAFETY,
+            safety_settings=_REVIEW_SAFETY,
         ),
     )
     return _response_text(resp).strip()
@@ -566,8 +580,9 @@ def process_video(job_id: str, video_path: str, meta: dict):
             config=types.GenerateContentConfig(
                 temperature=0.3,
                 max_output_tokens=8192,
-                response_mime_type="application/json",
-                thinking_config=types.ThinkingConfig(thinking_budget=2048),
+                # NOTE: response_mime_type="application/json" conflicts with
+                # thinking_budget and produces malformed JSON — omitted intentionally.
+                thinking_config=types.ThinkingConfig(thinking_budget=0),
                 safety_settings=_FILM_SAFETY,
             ),
         )
@@ -702,8 +717,7 @@ def process_document(job_id: str, doc_path: str, ext: str, meta: dict):
             config=types.GenerateContentConfig(
                 temperature=0.3,
                 max_output_tokens=8192,
-                response_mime_type="application/json",
-                thinking_config=types.ThinkingConfig(thinking_budget=2048),
+                thinking_config=types.ThinkingConfig(thinking_budget=0),
                 safety_settings=_FILM_SAFETY,
             ),
         )
@@ -2902,6 +2916,21 @@ body{background:var(--bg);color:var(--text);font-family:'Inter',sans-serif;min-h
   {% if a %}
   <div class="review-block">
     <div class="section-divider" style="margin-top:0">Detailed Assessment</div>
+    {% if a.ratings %}
+    {% set r = a.ratings %}
+    <div class="scores-row">
+      <div class="score-box"><span class="lbl">Originality</span><span class="num">{{ r.originality if r.originality is not none else '—' }}</span><span class="den">/10</span></div>
+      <div class="score-box"><span class="lbl">Direction</span><span class="num">{{ r.direction if r.direction is not none else '—' }}</span><span class="den">/10</span></div>
+      <div class="score-box"><span class="lbl">Writing</span><span class="num">{{ r.writing if r.writing is not none else '—' }}</span><span class="den">/10</span></div>
+      <div class="score-box"><span class="lbl">Cinematography</span><span class="num">{{ r.cinematography if r.cinematography is not none else '—' }}</span><span class="den">/10</span></div>
+      <div class="score-box"><span class="lbl">Performances</span><span class="num">{{ r.performances if r.performances is not none else '—' }}</span><span class="den">/10</span></div>
+      <div class="score-box"><span class="lbl">Production</span><span class="num">{{ r.production_value if r.production_value is not none else '—' }}</span><span class="den">/10</span></div>
+      <div class="score-box"><span class="lbl">Pacing</span><span class="num">{{ r.pacing if r.pacing is not none else '—' }}</span><span class="den">/10</span></div>
+      <div class="score-box"><span class="lbl">Structure</span><span class="num">{{ r.structure if r.structure is not none else '—' }}</span><span class="den">/10</span></div>
+      <div class="score-box"><span class="lbl">Sound / Music</span><span class="num">{{ r.sound_music if r.sound_music is not none else '—' }}</span><span class="den">/10</span></div>
+      <div class="score-box overall"><span class="lbl">Overall</span><span class="num">{{ '%.1f'|format(a.overall_rating|float) if a.overall_rating is not none else '—' }}</span><span class="den">/10</span></div>
+    </div>
+    {% else %}
     <div class="scores-row">
       <div class="score-box"><span class="lbl">Story</span><span class="num">{{ a.story.score if a.story else '—' }}</span><span class="den">/5</span></div>
       <div class="score-box"><span class="lbl">Direction</span><span class="num">{{ a.direction.score if a.direction else '—' }}</span><span class="den">/5</span></div>
@@ -2909,6 +2938,7 @@ body{background:var(--bg);color:var(--text);font-family:'Inter',sans-serif;min-h
       <div class="score-box"><span class="lbl">Originality</span><span class="num">{{ a.originality.score if a.originality else '—' }}</span><span class="den">/5</span></div>
       <div class="score-box overall"><span class="lbl">Overall</span><span class="num">{{ a.overall_score if a.overall_score is not none else '—' }}</span><span class="den">/20</span></div>
     </div>
+    {% endif %}
     <div class="obs-grid">
       {% if a.standout_moment %}<div class="obs-item standout"><span class="obs-lbl">Standout Moment</span><div class="obs-body">{{ a.standout_moment }}</div></div>{% endif %}
       {% if a.weakest_element %}<div class="obs-item weakest"><span class="obs-lbl">Growth Area</span><div class="obs-body">{{ a.weakest_element }}</div></div>{% endif %}
@@ -3753,12 +3783,28 @@ function showResults(job) {
   if (meta.festival_name){ filmTag.append(sep(), _span(meta.festival_name, 'color:var(--gold)')); }
   if (job.from_cache)    { filmTag.append(sep(), _span('⚡ cached', 'color:var(--green);font-size:10px')); }
 
-  // Score boxes
+  // Score boxes — new 9-criteria /10 structure, with legacy fallback
   const scoresRow = document.getElementById('scoresRow');
   scoresRow.textContent = '';
-  [{k:'story',l:'Story'},{k:'direction',l:'Direction'},{k:'technical',l:'Technical'},{k:'originality',l:'Originality'}]
-    .forEach(c => scoresRow.append(_scoreBox(c.l, (a[c.k] || {}).score ?? '—', 5)));
-  scoresRow.append(_scoreBox('Overall', a.overall_score ?? '—', 20, 'overall'));
+  const RLABELS = [['originality','Originality'],['direction','Direction'],['writing','Writing'],
+    ['cinematography','Cinematography'],['performances','Performances'],['production_value','Production'],
+    ['pacing','Pacing'],['structure','Structure'],['sound_music','Sound/Music']];
+  const ratings = (a.ratings && typeof a.ratings === 'object') ? a.ratings : null;
+  if (ratings) {
+    const nums = [];
+    RLABELS.forEach(([k,l]) => {
+      const v = ratings[k];
+      if (typeof v === 'number') nums.push(v);
+      scoresRow.append(_scoreBox(l, (typeof v === 'number' ? v : '—'), 10));
+    });
+    let overall = (typeof a.overall_rating === 'number') ? a.overall_rating
+                 : (nums.length ? nums.reduce((x,y)=>x+y,0)/nums.length : null);
+    scoresRow.append(_scoreBox('Overall', overall != null ? overall.toFixed(1) : '—', 10, 'overall'));
+  } else {
+    [{k:'story',l:'Story'},{k:'direction',l:'Direction'},{k:'technical',l:'Technical'},{k:'originality',l:'Originality'}]
+      .forEach(c => scoresRow.append(_scoreBox(c.l, (a[c.k] || {}).score ?? '—', 5)));
+    scoresRow.append(_scoreBox('Overall', a.overall_score ?? '—', 20, 'overall'));
+  }
 
   // Observation grid
   const obsGrid = document.getElementById('obsGrid');

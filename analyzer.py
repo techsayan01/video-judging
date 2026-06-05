@@ -141,5 +141,16 @@ def _parse_analysis(raw_text: str) -> dict:
     except json.JSONDecodeError:
         match = re.search(r'\{.*\}', clean, re.DOTALL)
         if match:
-            return json.loads(match.group())
+            try:
+                return json.loads(match.group())
+            except json.JSONDecodeError:
+                pass
+            # Final fallback: auto-repair malformed JSON from Gemini
+            try:
+                from json_repair import repair_json
+                result = json.loads(repair_json(match.group()))
+                print("  [warn] JSON repaired automatically")
+                return result
+            except Exception:
+                pass
         raise ValueError(f"Could not parse Gemini response as JSON:\n{raw_text[:500]}")
