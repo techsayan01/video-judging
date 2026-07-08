@@ -372,6 +372,39 @@ def admin_required(f):
 
 
 # ── Helpers ───────────────────────────────────────────────
+def _gemini_generate_with_retry(client, model_id: str, contents, config,
+                                 max_retries: int = 3, base_delay: float = 10.0):
+    """Call generate_content with exponential-backoff retry for transient OTHER blocks.
+    BlockedReason.OTHER can be transient (quota, internal Gemini policy) and often
+    succeeds on retry.  Harm-category blocks (SAFETY) are not retried."""
+    import time as _time
+    last_exc = None
+    for attempt in range(max_retries):
+        resp = client.models.generate_content(model=model_id, contents=contents, config=config)
+        txt = getattr(resp, "text", None)
+        if txt and txt.strip():
+            return resp
+        # Inspect block reason
+        try:
+            fb = getattr(resp, "prompt_feedback", None)
+            br = getattr(fb, "block_reason", None) if fb else None
+            if br is None:
+                cand = (getattr(resp, "candidates", None) or [None])[0]
+                br = getattr(cand, "finish_reason", None) if cand else None
+        except Exception:
+            br = None
+        br_name = str(br) if br else ""
+        # Don't retry definitive safety blocks — only transient OTHER / unknown
+        if "SAFETY" in br_name or "PROHIBITED" in br_name:
+            return resp  # let _response_text raise the proper error
+        if attempt < max_retries - 1:
+            delay = base_delay * (2 ** attempt)
+            print(f"  [retry] Gemini returned empty ({br_name}), attempt {attempt+1}/{max_retries}, "
+                  f"retrying in {delay:.0f}s…", flush=True)
+            _time.sleep(delay)
+    return resp  # final attempt result, callers handle the empty case
+
+
 def _response_text(resp) -> str:
     """Return the model's text, or raise a clear error explaining why it's empty.
     Gemini returns no text when a request is blocked (safety/recitation), hits the
@@ -574,10 +607,9 @@ def process_video(job_id: str, video_path: str, meta: dict):
         # ── 3. Score & analyse ────────────────────────────────────────────
         db.job_update(job_id, {"status": "analysing", "progress": 65,
                                 "message": "Scoring story, direction & craft…"})
-        analysis_resp = client.models.generate_content(
-            model=model_id,
-            contents=analysis_contents,
-            config=types.GenerateContentConfig(
+        analysis_resp = _gemini_generate_with_retry(
+            client, model_id, analysis_contents,
+            types.GenerateContentConfig(
                 temperature=0.3,
                 max_output_tokens=8192,
                 # NOTE: response_mime_type="application/json" conflicts with
@@ -711,10 +743,9 @@ def process_document(job_id: str, doc_path: str, ext: str, meta: dict):
 
         db.job_update(job_id, {"status": "scoring", "progress": 65,
                                 "message": "Scoring the writing…"})
-        resp = client.models.generate_content(
-            model=model_id,
-            contents=contents,
-            config=types.GenerateContentConfig(
+        resp = _gemini_generate_with_retry(
+            client, model_id, contents,
+            types.GenerateContentConfig(
                 temperature=0.3,
                 max_output_tokens=8192,
                 thinking_config=types.ThinkingConfig(thinking_budget=0),
