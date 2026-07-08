@@ -164,10 +164,14 @@ def film_find_by_screener(screener_url: str) -> dict | None:
     )
 
 
-def film_find_by_identity(title: str, director: str, duration_min: float | None = None) -> dict | None:
-    """Match by title+director. If duration_min given, also require runtime within ±2 min.
-    When several records share the same identity (e.g. earlier failed attempts that
-    never produced an analysis), prefer the one that actually has a cached analysis.
+def film_find_by_identity(title: str, director: str, festival_key: str | None = None,
+                           duration_min: float | None = None) -> dict | None:
+    """Match by title+director, confined to one festival. If duration_min given,
+    also require runtime within ±2 min. When several records share the same
+    identity (e.g. earlier failed attempts that never produced an analysis),
+    prefer the one that actually has a cached analysis.
+    Dedup is intentionally scoped per-festival — the same film submitted to two
+    different festivals should be judged independently, not share cached analysis.
     """
     if not title or not director:
         return None
@@ -175,6 +179,8 @@ def film_find_by_identity(title: str, director: str, duration_min: float | None 
         "title_lc":    title.strip().lower(),
         "director_lc": director.strip().lower(),
     }
+    if festival_key:
+        query["festival_key"] = festival_key
     if duration_min is not None:
         query["runtime_min"] = {"$gte": duration_min - 2, "$lte": duration_min + 2}
     # Prefer a record with a non-empty analysis; fall back to the most recent match
@@ -204,6 +210,7 @@ def film_create(data: dict) -> str:
         "runtime_min":        data.get("runtime_min"),
         "country":            data.get("country", ""),
         "screener_url":       data.get("screener_url", ""),
+        "festival_key":       data.get("festival_key", ""),
         "analysis":           data.get("analysis") or {},
         "analysed_at":        None,
         "created_at":         now,

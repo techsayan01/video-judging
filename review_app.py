@@ -372,6 +372,21 @@ def admin_required(f):
 
 
 # ── Helpers ───────────────────────────────────────────────
+def _friendly_error(e: Exception) -> str:
+    """Turn a raw exception into an actionable message. In particular, detect
+    invalid/expired/revoked Gemini API keys, which otherwise surface as an
+    opaque 400/401/403 from the SDK and get mistaken for content-safety blocks."""
+    msg = str(e)
+    low = msg.lower()
+    if any(s in low for s in ("api key not valid", "api_key_invalid", "invalid api key",
+                               "unauthenticated", "permission_denied", "403 forbidden")):
+        return ("Gemini API key is invalid, expired, or revoked for this festival. "
+                "Ask an admin to check/update the key in Manage Festival → Gemini API Key.")
+    if "resource_exhausted" in low or "quota" in low or "429" in low:
+        return "Gemini API quota exceeded for this festival's key. Please try again later or ask an admin to check the quota."
+    return msg[:300]
+
+
 def _gemini_generate_with_retry(client, model_id: str, contents, config,
                                  max_retries: int = 3, base_delay: float = 10.0):
     """Call generate_content with exponential-backoff retry for transient OTHER blocks.
@@ -646,7 +661,7 @@ def process_video(job_id: str, video_path: str, meta: dict):
 
     except Exception as e:
         logging.exception("[process] job %s failed", job_id)
-        db.job_update(job_id, {"status": "error", "progress": 0, "message": str(e)[:300]})
+        db.job_update(job_id, {"status": "error", "progress": 0, "message": _friendly_error(e)})
     finally:
         if gcs_blob and GCS_BUCKET:
             delete_from_gcs(GCS_BUCKET, gcs_blob)
@@ -693,7 +708,7 @@ def process_rewrite(job_id: str, film: dict, meta: dict):
         })
     except Exception as e:
         logging.exception("[process] job %s failed", job_id)
-        db.job_update(job_id, {"status": "error", "progress": 0, "message": str(e)[:300]})
+        db.job_update(job_id, {"status": "error", "progress": 0, "message": _friendly_error(e)})
 
 
 # ── Document (script) processing thread ───────────────────
@@ -774,7 +789,7 @@ def process_document(job_id: str, doc_path: str, ext: str, meta: dict):
         })
     except Exception as e:
         logging.exception("[process] job %s failed", job_id)
-        db.job_update(job_id, {"status": "error", "progress": 0, "message": str(e)[:300]})
+        db.job_update(job_id, {"status": "error", "progress": 0, "message": _friendly_error(e)})
     finally:
         for uf in uploaded_files:
             try: client.files.delete(name=uf.name)
@@ -882,14 +897,23 @@ def get_upload_url():
 @login_required
 @limiter.limit("20 per minute")
 def check_dedup():
-    """Pre-flight: does a cached analysis already exist for this title+director?
-    Lets the client skip uploading the video entirely on a dedup hit."""
+    """Pre-flight: does a cached analysis already exist for this title+director
+    within the caller's own festival? Lets the client skip uploading the video
+    entirely on a dedup hit. Scoped per-festival, not global."""
     data     = request.get_json(silent=True) or {}
     title    = _sanitise(data.get("title", ""))
     director = _sanitise(data.get("director", ""))
     if not title or not director:
         return jsonify({"found": False})
-    existing = db.film_find_by_identity(title, director)
+    festivals_db  = get_festivals()
+    user_role     = session.get("role", "user")
+    user_festival = db.user_get(session.get("user", "")) or {}
+    user_fk       = user_festival.get("festival_key", "")
+    festival_key  = data.get("festival_key", "").strip() if user_role == "admin" else ""
+    festival_key  = festival_key or user_fk or DEFAULT_FESTIVAL
+    if festival_key not in festivals_db:
+        festival_key = next(iter(festivals_db), DEFAULT_FESTIVAL)
+    existing = db.film_find_by_identity(title, director, festival_key=festival_key)
     found    = bool(existing and existing.get("analysis"))
     return jsonify({"found": found})
 
@@ -943,7 +967,8 @@ def upload():
     if _is_script_category(genre):
         has_doc = "document" in request.files and request.files["document"].filename
         # Dedup: reuse cached analysis if this written work was already judged
-        existing = db.film_find_by_identity(title, director)
+        # within this festival (dedup is scoped per-festival, not global)
+        existing = db.film_find_by_identity(title, director, festival_key=festival_key)
         if existing and existing.get("analysis"):
             if has_doc:
                 try: request.files["document"].stream.close()
@@ -982,6 +1007,7 @@ def upload():
             "film_id": film_id, "title": title, "director": director,
             "logline": logline, "director_statement": dir_stmt,
             "genre": genre, "runtime": "", "screener_url": "",
+            "festival_key": festival_key,
         })
         meta = {
             "film_id": film_id, "title": title, "director": director,
@@ -998,12 +1024,12 @@ def upload():
         threading.Thread(target=process_document, args=(job_id, tmp.name, ext, meta), daemon=True).start()
         return jsonify({"job_id": job_id})
 
-    # ── Cross-festival dedup ──────────────────────────────
-    # If the same film (title + director) was already analysed — e.g. submitted to
-    # another festival — reuse the cached Gemini analysis instead of re-running
-    # vision. We only write a fresh review for THIS festival and store a new
-    # review record mapped to it.
-    existing = db.film_find_by_identity(title, director)
+    # ── Per-festival dedup ─────────────────────────────────
+    # If the same film (title + director) was already analysed within THIS
+    # festival, reuse the cached Gemini analysis instead of re-running vision.
+    # Dedup is scoped per-festival so the same film submitted to different
+    # festivals is judged independently.
+    existing = db.film_find_by_identity(title, director, festival_key=festival_key)
     if existing and existing.get("analysis"):
         # Discard the just-uploaded video — we don't need to re-analyse it
         if gcs_blob:
@@ -1076,6 +1102,7 @@ def upload():
         "genre":              genre,
         "runtime":            "",
         "screener_url":       "",
+        "festival_key":       festival_key,
     })
 
     meta = {
@@ -3620,7 +3647,7 @@ async function submitReview() {
   showProcessing();
   try {
     // ── Step 0: dedup pre-check — skip the upload entirely if this film
-    // (title + director) was already analysed for another festival. ──
+    // (title + director) was already analysed within this festival. ──
     setProgressMsg('Checking for an existing analysis of this film…', 4);
     let blob_name = '';
     let isDedup   = false;
@@ -3628,7 +3655,7 @@ async function submitReview() {
       const ddRes = await fetch('/api/check-dedup', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ title, director }),
+        body: JSON.stringify({ title, director, festival_key: document.getElementById('festivalKey').value }),
       });
       if (ddRes.ok) { const dd = await ddRes.json(); isDedup = !!dd.found; }
     } catch(_) { /* non-fatal — fall through to normal upload */ }
