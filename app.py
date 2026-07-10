@@ -74,7 +74,7 @@ TEMPLATE = """
   .section-label { font-size:10px; letter-spacing:2px; color:var(--gold);
                     text-transform:uppercase; font-family:'DM Mono',monospace;
                     margin-bottom:12px; }
-  .scores { display:grid; grid-template-columns:1fr 1fr; gap:8px;
+  .scores { display:grid; grid-template-columns:1fr 1fr 1fr; gap:8px;
              margin-bottom:16px; }
   .score-box { background:var(--bg3); border-radius:8px; padding:10px 12px; }
   .score-box label { font-size:10px; color:var(--muted); display:block;
@@ -177,7 +177,7 @@ TEMPLATE = """
       </div>
       {% if a %}
       <div style="font-family:'DM Mono',monospace; font-size:28px; color:var(--gold);">
-        {{ a.overall_score }}<small style="font-size:14px;color:var(--muted)">/20</small>
+        {{ a.overall_rating }}<small style="font-size:14px;color:var(--muted)">/10</small>
       </div>
       {% endif %}
     </div>
@@ -195,25 +195,53 @@ TEMPLATE = """
         {% endif %}
 
         {% if a %}
+        {% set ratings = a.ratings or {} %}
+        {% set notes = a.notes or {} %}
         <div class="scores">
           <div class="score-box">
-            <label>Story</label>
-            <div class="score-val">{{ a.story.score }}<small>/5</small></div>
+            <label>Originality</label>
+            <div class="score-val">{{ ratings.originality }}<small>/10</small></div>
           </div>
           <div class="score-box">
             <label>Direction</label>
-            <div class="score-val">{{ a.direction.score }}<small>/5</small></div>
+            <div class="score-val">{{ ratings.direction }}<small>/10</small></div>
           </div>
           <div class="score-box">
-            <label>Technical</label>
-            <div class="score-val">{{ a.technical.score }}<small>/5</small></div>
+            <label>Writing</label>
+            <div class="score-val">{{ ratings.writing }}<small>/10</small></div>
           </div>
           <div class="score-box">
-            <label>Originality</label>
-            <div class="score-val">{{ a.originality.score }}<small>/5</small></div>
+            <label>Cinematography</label>
+            <div class="score-val">{{ ratings.cinematography }}<small>/10</small></div>
+          </div>
+          <div class="score-box">
+            <label>Performances</label>
+            <div class="score-val">{{ ratings.performances }}<small>/10</small></div>
+          </div>
+          <div class="score-box">
+            <label>Prod. Value</label>
+            <div class="score-val">{{ ratings.production_value }}<small>/10</small></div>
+          </div>
+          <div class="score-box">
+            <label>Pacing</label>
+            <div class="score-val">{{ ratings.pacing }}<small>/10</small></div>
+          </div>
+          <div class="score-box">
+            <label>Structure</label>
+            <div class="score-val">{{ ratings.structure }}<small>/10</small></div>
+          </div>
+          <div class="score-box">
+            <label>Sound / Music</label>
+            <div class="score-val">{{ ratings.sound_music }}<small>/10</small></div>
           </div>
         </div>
 
+        {% if a.recommendation %}
+        <div class="obs-item">
+          <label>Recommendation</label>
+          <div class="highlight">{{ a.recommendation }}</div>
+        </div>
+        {% endif %}
         <div class="obs-item">
           <label>Standout Moment</label>
           <div class="highlight">{{ a.standout_moment }}</div>
@@ -226,14 +254,18 @@ TEMPLATE = """
           <label>Festival Suitability</label>
           <p>{{ a.festival_suitability }}</p>
         </div>
+        {% if notes.writing %}
         <div class="obs-item">
-          <label>Story Notes</label>
-          <p>{{ a.story.notes }}</p>
+          <label>Writing Notes</label>
+          <p>{{ notes.writing }}</p>
         </div>
+        {% endif %}
+        {% if notes.direction %}
         <div class="obs-item">
-          <label>Technical Notes</label>
-          <p>{{ a.technical.notes }}</p>
+          <label>Direction Notes</label>
+          <p>{{ notes.direction }}</p>
         </div>
+        {% endif %}
         {% else %}
         <p style="color:var(--red);font-size:13px;">
           Analysis unavailable{% if item.error %}: {{ item.error }}{% endif %}
