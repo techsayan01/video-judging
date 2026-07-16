@@ -371,6 +371,17 @@ def admin_required(f):
     return wrapper
 
 
+def _visible_festival_keys() -> list[str]:
+    """Festival keys the current user is allowed to read data for.
+    Admins see festivals they created; regular users see only their own.
+    Used to tenant-scope film/analysis reads and prevent cross-festival IDOR."""
+    user = session.get("user", "")
+    if session.get("role") == "admin":
+        return list(_admin_festivals(user).keys())
+    fk = (db.user_get(user) or {}).get("festival_key", "")
+    return [fk] if fk else []
+
+
 # ── Helpers ───────────────────────────────────────────────
 def _friendly_error(e: Exception) -> str:
     """Turn a raw exception into an actionable message. In particular, detect
@@ -384,7 +395,11 @@ def _friendly_error(e: Exception) -> str:
                 "Ask an admin to check/update the key in Manage Festival → Gemini API Key.")
     if "resource_exhausted" in low or "quota" in low or "429" in low:
         return "Gemini API quota exceeded for this festival's key. Please try again later or ask an admin to check the quota."
-    return msg[:300]
+    # Unrecognised error: don't leak internal details to the client. Log the full
+    # exception server-side and hand the user a correlation id to quote in support.
+    ref = uuid.uuid4().hex[:8]
+    logging.error("[error] ref=%s %s", ref, msg)
+    return f"Something went wrong while processing this film (ref: {ref}). Please try again or contact an admin."
 
 
 def _gemini_generate_with_retry(client, model_id: str, contents, config,
@@ -801,7 +816,7 @@ def process_document(job_id: str, doc_path: str, ext: str, meta: dict):
 
 # ── Routes ────────────────────────────────────────────────
 @app.route("/login", methods=["GET", "POST"])
-@limiter.limit("10 per minute")
+@limiter.limit("5 per minute; 50 per hour", methods=["POST"])
 def login():
     error = ""
     if request.method == "POST":
@@ -863,8 +878,8 @@ def index():
 @app.route("/api/films")
 @login_required
 def api_films():
-    """Return all films in the DB (for the frontend picker)."""
-    return jsonify(db.film_list())
+    """Return films visible to the current user — scoped to their festival(s)."""
+    return jsonify(db.film_list(_visible_festival_keys()))
 
 
 GCS_UPLOAD_BUCKET = os.getenv("GCS_UPLOAD_BUCKET", "")
@@ -1311,6 +1326,11 @@ def review_detail(film_id):
     if not film:
         return "Film not found", 404
 
+    # Tenant scoping: only reveal a film (and its analysis) if it belongs to a
+    # festival the user may read. Return 404 (not 403) to avoid leaking existence.
+    if film.get("festival_key") not in _visible_festival_keys():
+        return "Film not found", 404
+
     if user_role == "admin":
         my_festivals = _admin_festivals(session.get("user", ""))
         reviews = db.review_list_for_film(film_id)
@@ -1559,6 +1579,8 @@ def api_predefined_categories():
 @app.route("/api/festivals/<key>/categories", methods=["GET"])
 @login_required
 def api_categories_list(key):
+    err = _assert_festival_access(key)
+    if err: return err
     return jsonify({"categories": db.category_list(key)})
 
 
@@ -1649,6 +1671,8 @@ def api_category_prompt_set(key, name):
 @app.route("/api/festivals/<key>/seasons", methods=["GET"])
 @login_required
 def api_seasons_list(key):
+    err = _assert_festival_access(key)
+    if err: return err
     return jsonify({"seasons": db.season_list(key)})
 
 

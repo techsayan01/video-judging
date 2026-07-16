@@ -26,11 +26,18 @@ brew install ffmpeg yt-dlp   # if not already installed
 ```
 
 ### 2. Create .env file
+Copy `.env.example` to `.env` and fill in your values:
 ```
 GEMINI_API_KEY=your_key_here
 FESTIVAL_NAME=ElegantIFF
 REVIEWER_NAME=Your Name
 ```
+
+> **Security:** `.env` is gitignored and must never be committed. In production,
+> secrets are injected from GCP Secret Manager (see `deploy.sh`), not a `.env` file.
+> If any secret (Gemini key, `MONGODB_URI`, `FLASK_SECRET`, admin password) is ever
+> committed or otherwise exposed, **rotate it immediately** — a leaked value stays
+> recoverable in git history even after removal.
 
 ### 3. Export CSV from FilmFreeway
 FilmFreeway → your festival → Entries → Export CSV

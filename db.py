@@ -147,8 +147,14 @@ def _clean_film(doc: dict | None) -> dict | None:
     return doc
 
 
-def film_list() -> list[dict]:
-    docs = _get_db()["films"].find({}, sort=[("created_at", DESCENDING)])
+def film_list(festival_keys: list[str] | None = None) -> list[dict]:
+    """List films. If festival_keys is given, restrict to those festivals
+    (tenant scoping). Passing None returns every film — callers that expose
+    results to end users MUST pass an explicit key list."""
+    query: dict = {}
+    if festival_keys is not None:
+        query = {"festival_key": {"$in": list(festival_keys)}}
+    docs = _get_db()["films"].find(query, sort=[("created_at", DESCENDING)])
     return [_clean_film(d) for d in docs]
 
 
