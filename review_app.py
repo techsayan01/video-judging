@@ -34,6 +34,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 from festivals import FESTIVALS as SEED_FESTIVALS, DEFAULT_FESTIVAL, get_festival, DOMAIN_FESTIVAL_MAP
 from prompts import build_analysis_prompt, build_review_prompt, _cap_words
 import db
+import wordpress
 
 # Limit concurrent video-processing threads — keeps memory bounded under 5 simultaneous users
 _processing_sem = threading.Semaphore(5)
@@ -854,9 +855,16 @@ def logout():
 @app.route("/")
 @login_required
 def index():
-    # Admins belong on /admin, not the review form
+    # Everyone lands on the dashboard; admins get the admin console.
     if session.get("role") == "admin":
         return redirect("/admin")
+    return redirect("/dashboard")
+
+
+@app.route("/new")
+@login_required
+def new_review():
+    """Film upload + review generation form."""
     user_doc = db.user_get(session.get("user", "")) or {}
     user_role        = user_doc.get("role", "user")
     festivals        = get_festivals()
@@ -865,14 +873,51 @@ def index():
         user_festival = next(iter(festivals), DEFAULT_FESTIVAL)
     # Build a categories map keyed by festival slug for the JS dropdown
     categories_map = {k: v.get("categories", []) for k, v in festivals.items()}
-    return render_template_string(APP_HTML,
-                                  festival=festivals.get(user_festival, {}).get("name", "Festival Reviewer"),
-                                  festivals=festivals,
-                                  categories_map=categories_map,
-                                  default_festival=DEFAULT_FESTIVAL,
-                                  user=session.get("user", ""),
-                                  user_role=user_role,
-                                  user_festival=user_festival)
+    return render_page("new", "New Review", APP_BODY,
+                       festival=festivals.get(user_festival, {}).get("name", "Festival Reviewer"),
+                       festivals=festivals,
+                       categories_map=categories_map,
+                       default_festival=DEFAULT_FESTIVAL,
+                       user=session.get("user", ""),
+                       user_role=user_role,
+                       user_festival=user_festival)
+
+
+@app.route("/dashboard")
+@login_required
+def dashboard():
+    """Overview: stat cards + recent reviews."""
+    user       = session.get("user", "")
+    user_role  = session.get("role", "user")
+    if user_role == "admin":
+        my_festivals = _admin_festivals(user)
+        reviews = []
+        for fk in my_festivals:
+            for r in db.review_list_for_festival(fk):
+                r["festival_name"] = my_festivals[fk].get("name", fk)
+                reviews.append(r)
+        reviews.sort(key=lambda r: r.get("created_at", ""), reverse=True)
+        scope_name = "All festivals"
+    else:
+        user_doc      = db.user_get(user) or {}
+        festival_key  = user_doc.get("festival_key", "")
+        festivals_db  = get_festivals()
+        scope_name    = festivals_db.get(festival_key, {}).get("name", festival_key or "—")
+        reviews       = db.review_list_for_festival(festival_key)
+        for r in reviews:
+            r["festival_name"] = scope_name
+
+    rated = [float(r["overall_rating"]) for r in reviews
+             if r.get("overall_rating") not in (None, "")]
+    stats = {
+        "total":     len(reviews),
+        "avg":       (f"{sum(rated)/len(rated):.1f}" if rated else "—"),
+        "published": sum(1 for r in reviews if r.get("wp_post_id")),
+        "seasons":   len({r.get("season") for r in reviews if r.get("season")}),
+    }
+    return render_page("dashboard", "Dashboard", DASHBOARD_BODY,
+                       stats=stats, reviews=reviews[:6], scope_name=scope_name,
+                       user_role=user_role, is_admin=(user_role == "admin"))
 
 
 @app.route("/api/films")
@@ -1306,7 +1351,7 @@ def reviews_list():
         if g and g not in all_categories:
             all_categories.append(g)
 
-    return render_template_string(REVIEWS_HTML,
+    return render_page("reviews", "Past Reviews", REVIEWS_BODY,
                                   reviews=all_reviews,
                                   festival_name=festival_name,
                                   seasons=all_seasons,
@@ -1344,7 +1389,7 @@ def review_detail(film_id):
         for r in reviews:
             r["festival_name"] = festivals_db.get(festival_key, {}).get("name", festival_key)
 
-    return render_template_string(REVIEW_DETAIL_HTML,
+    return render_page("reviews", film.get("title", "Review"), REVIEW_DETAIL_BODY,
                                   film=film,
                                   reviews=reviews,
                                   user_role=user_role,
@@ -1396,7 +1441,7 @@ def admin():
         u for u in db.user_list()
         if u.get("role") != "admin" and u.get("festival_key", "") in my_festival_keys
     ]
-    return render_template_string(ADMIN_HTML,
+    return render_page("admin", "Admin", ADMIN_BODY,
                                   users=users,
                                   festivals=my_festivals,
                                   default_review_prompt=DEFAULT_REVIEW_PROMPT,
@@ -1714,6 +1759,161 @@ def api_season_delete(key, name):
     return jsonify({"seasons": db.season_list(key)})
 
 
+# ── WordPress integration ─────────────────────────────────────────────────────
+
+@app.route("/wordpress")
+@admin_required
+def wordpress_page():
+    """Per-festival WordPress config + reference-design template editor."""
+    my_festivals = _admin_festivals(session.get("user", ""))
+    # Never send the app password to the browser — only whether it is set.
+    safe = {}
+    for k, f in my_festivals.items():
+        safe[k] = {
+            "name":            f.get("name", k),
+            "wp_url":          f.get("wp_url", ""),
+            "wp_user":         f.get("wp_user", ""),
+            "wp_configured":   bool(f.get("wp_app_pass")),
+            "wp_default_status": f.get("wp_default_status", "draft"),
+            "wp_template":     f.get("wp_template", ""),
+        }
+    return render_page("wordpress", "WordPress", WORDPRESS_BODY,
+                       festivals=safe,
+                       placeholders=wordpress.PLACEHOLDERS,
+                       default_template=wordpress.DEFAULT_WP_TEMPLATE,
+                       current_user=session.get("user", ""))
+
+
+@app.route("/api/festivals/<key>/wp/config", methods=["POST"])
+@admin_required
+@limiter.limit("20 per minute")
+def api_wp_config(key):
+    err = _assert_festival_access(key)
+    if err: return err
+    existing = db.festival_get(key) or {}
+    data = request.json or {}
+    try:
+        wp_url = data.get("wp_url", "").strip()
+        if wp_url:
+            wp_url = wordpress._safe_base_url(wp_url)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    fields = dict(existing)
+    fields["wp_url"]  = wp_url
+    fields["wp_user"] = (data.get("wp_user", "") or "").strip()[:128]
+    fields["wp_default_status"] = "publish" if data.get("wp_default_status") == "publish" else "draft"
+    # Only overwrite the secret when a new non-empty value is supplied
+    new_pass = (data.get("wp_app_pass", "") or "").strip()
+    if new_pass:
+        fields["wp_app_pass"] = new_pass[:256]
+    db.festival_upsert(key, fields)
+    return jsonify({"ok": True, "wp_configured": bool(fields.get("wp_app_pass"))})
+
+
+@app.route("/api/festivals/<key>/wp/template", methods=["PUT"])
+@admin_required
+@limiter.limit("30 per minute")
+def api_wp_template_save(key):
+    err = _assert_festival_access(key)
+    if err: return err
+    existing = db.festival_get(key) or {}
+    template = (request.json or {}).get("template", "")
+    if len(template) > 40000:
+        return jsonify({"error": "Template too large"}), 400
+    fields = dict(existing)
+    fields["wp_template"] = template
+    db.festival_upsert(key, fields)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/festivals/<key>/wp/template/generate", methods=["POST"])
+@admin_required
+@limiter.limit("6 per minute")
+def api_wp_template_generate(key):
+    err = _assert_festival_access(key)
+    if err: return err
+    festival = get_festivals().get(key)
+    if not festival:
+        return jsonify({"error": "Festival not found"}), 404
+    data = request.json or {}
+    ref_url  = (data.get("reference_url", "") or "").strip()
+    ref_html = (data.get("reference_html", "") or "").strip()
+    try:
+        if ref_url and not ref_html:
+            ref_html = wordpress.fetch_reference(ref_url)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"error": f"Could not fetch the reference URL: {e}"}), 400
+    if not ref_html:
+        return jsonify({"error": "Provide a reference URL or paste reference HTML."}), 400
+    api_key = festival.get("gemini_api_key")
+    if not api_key:
+        return jsonify({"error": "No Gemini API key configured for this festival."}), 400
+    try:
+        client = genai.Client(api_key=api_key)
+        model  = festival.get("gemini_model", "gemini-2.5-flash")
+        template = wordpress.generate_template_from_reference(client, model, ref_html[:60000])
+    except Exception as e:
+        return jsonify({"error": _friendly_error(e)}), 502
+    return jsonify({"template": template})
+
+
+@app.route("/api/festivals/<key>/wp/preview", methods=["POST"])
+@login_required
+@limiter.limit("30 per minute")
+def api_wp_preview(key):
+    err = _assert_festival_access(key)
+    if err: return err
+    festival = get_festivals().get(key) or {}
+    template = (request.json or {}).get("template") or festival.get("wp_template") or wordpress.DEFAULT_WP_TEMPLATE
+    # Sample data so admins can preview layout without a real film
+    sample_film = {
+        "title": "Sample Film Title", "director": "A. Director", "genre": "Narrative Short",
+        "runtime": "14", "country": "France",
+        "analysis": {"ratings": {"originality": 8, "direction": 9, "writing": 7,
+                                 "cinematography": 9, "performances": 8, "production_value": 7,
+                                 "pacing": 8, "structure": 8, "sound_music": 7},
+                     "overall_rating": 8.2,
+                     "standout_moment": "A wordless, beautifully composed closing shot.",
+                     "weakest_element": "The second act loses a little momentum.",
+                     "festival_suitability": "A strong fit for art-house and short-film programmes."}}
+    sample_review = {"review_text": "This is a preview of how a published review will look.\n\n"
+                                    "Each paragraph of the expert review renders here, styled by the "
+                                    "reference design you supplied.", "season": "2025", "overall_rating": 8.2}
+    ctx = wordpress.build_context(sample_film, sample_review, festival)
+    return jsonify({"html": wordpress.render_template(template, ctx)})
+
+
+@app.route("/api/reviews/<film_id>/publish", methods=["POST"])
+@login_required
+@limiter.limit("20 per minute")
+def api_publish_review(film_id):
+    film = db.film_get(film_id)
+    if not film or film.get("festival_key") not in _visible_festival_keys():
+        return jsonify({"error": "Review not found"}), 404
+    fk = film.get("festival_key")
+    festival = get_festivals().get(fk) or {}
+    review = db.review_get(film_id, fk)
+    if not review:
+        return jsonify({"error": "No review exists for this film yet."}), 400
+    if not wordpress.wp_configured(festival):
+        return jsonify({"error": "WordPress is not configured for this festival. "
+                                 "Ask an admin to set it up under WordPress."}), 400
+    status = "publish" if (request.json or {}).get("status") == "publish" else "draft"
+    template = festival.get("wp_template") or wordpress.DEFAULT_WP_TEMPLATE
+    ctx = wordpress.build_context(film, review, festival)
+    content = wordpress.render_template(template, ctx)
+    title = f"{film.get('title','Untitled')} — {festival.get('name','')} Expert Review"
+    post_id = review.get("wp_post_id") or None
+    result = wordpress.publish(festival, title, content, status=status, post_id=post_id)
+    if not result.get("success"):
+        return jsonify({"error": result.get("error", "Publish failed")}), 502
+    db.review_set_wp(film_id, fk, str(result.get("post_id", "")), result.get("url", ""))
+    logging.info("[wp] Published film=%s festival=%s status=%s by %s", film_id, fk, status, session.get("user"))
+    return jsonify({"ok": True, "status": status, "url": result.get("url", ""), "post_id": result.get("post_id")})
+
+
 @app.route("/manage")
 @login_required
 def manage():
@@ -1736,7 +1936,7 @@ def manage():
                 session["festival_key"] = fk   # patch the live session
         if fk:
             return redirect(f"/manage/{fk}")
-        return render_template_string(MANAGE_HTML,
+        return render_page("manage", "Manage", MANAGE_BODY,
                                       festivals={},
                                       user_role=user_role,
                                       current_user=session.get("user", ""))
@@ -1765,13 +1965,664 @@ def manage_festival(festival_key: str):
             return redirect(f"/manage/{assigned}")
         festivals = {festival_key: all_fests[festival_key]} if festival_key in all_fests else {}
 
-    return render_template_string(MANAGE_HTML,
+    return render_page("manage", "Manage", MANAGE_BODY,
                                   festivals=festivals,
                                   user_role=user_role,
                                   current_user=session.get("user", ""))
 
 
+# ── App-shell design system ───────────────────────────────
+SHELL_CSS = """
+*{margin:0;padding:0;box-sizing:border-box}
+:root{
+  --gold:#d1af62;--gold-l:#ecca86;--gold-d:#a2854a;
+  --bg:#0a0a0d;--bg2:#141419;--bg3:#1c1c24;--bg4:#24242e;
+  --sidebar:#0e0e12;
+  --border:rgba(255,255,255,.08);--border-gold:rgba(209,175,98,.22);
+  --text:#eceae4;--dim:#a29e96;--muted:#78747f;
+  --green:#5cbf8a;--red:#e5695f;--blue:#6f9de8;
+  --radius:14px;--shadow:0 12px 40px -24px rgba(0,0,0,.8);
+}
+html,body{height:100%}
+body{background:var(--bg);color:var(--text);font-family:'DM Sans',sans-serif;
+     -webkit-font-smoothing:antialiased}
+::selection{background:rgba(209,175,98,.28);color:#fff}
+a{color:inherit}
+::-webkit-scrollbar{width:10px;height:10px}
+::-webkit-scrollbar-thumb{background:#2a2a34;border-radius:6px;border:2px solid var(--bg)}
+::-webkit-scrollbar-thumb:hover{background:#38384a}
+
+/* ── App grid ── */
+.app{display:grid;grid-template-columns:250px 1fr;min-height:100vh}
+.main-col{display:flex;flex-direction:column;min-width:0}
+
+/* ── Sidebar ── */
+.sidebar{background:var(--sidebar);border-right:1px solid var(--border);
+         display:flex;flex-direction:column;position:sticky;top:0;height:100vh;z-index:40}
+.brand{display:flex;align-items:center;gap:11px;padding:20px 20px 18px;border-bottom:1px solid var(--border)}
+.brand-mark{width:34px;height:34px;border-radius:10px;flex-shrink:0;
+            background:linear-gradient(145deg,rgba(209,175,98,.2),rgba(209,175,98,.05));
+            border:1px solid var(--border-gold);display:flex;align-items:center;justify-content:center;color:var(--gold)}
+.brand-mark svg{width:18px;height:18px}
+.brand-name{font-family:'Bebas Neue',sans-serif;font-size:21px;letter-spacing:1.5px;color:var(--gold);line-height:1}
+.brand-sub{font-size:8.5px;letter-spacing:2px;text-transform:uppercase;color:var(--muted);font-family:'DM Mono',monospace;margin-top:2px}
+.sidebar-nav{flex:1;padding:14px 12px;display:flex;flex-direction:column;gap:3px;overflow-y:auto}
+.nav-section{font-size:9px;letter-spacing:1.6px;text-transform:uppercase;color:var(--muted);
+             font-family:'DM Mono',monospace;padding:14px 12px 6px}
+.nav-item{display:flex;align-items:center;gap:11px;padding:10px 12px;border-radius:10px;
+          font-size:13.5px;color:var(--dim);text-decoration:none;transition:all .15s;font-weight:500}
+.nav-item svg{width:17px;height:17px;flex-shrink:0;opacity:.85}
+.nav-item:hover{background:rgba(255,255,255,.04);color:var(--text)}
+.nav-item.active{background:linear-gradient(90deg,rgba(209,175,98,.16),rgba(209,175,98,.04));
+                 color:var(--gold);box-shadow:inset 2px 0 0 var(--gold)}
+.nav-item.active svg{opacity:1;color:var(--gold)}
+.sidebar-foot{border-top:1px solid var(--border);padding:14px}
+.sidebar-user{display:flex;align-items:center;gap:10px;padding:8px 10px;border-radius:10px}
+.avatar{width:32px;height:32px;border-radius:50%;flex-shrink:0;background:linear-gradient(145deg,var(--gold),var(--gold-d));
+        color:#1a1408;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:13px;text-transform:uppercase}
+.sidebar-user-meta{min-width:0}
+.sidebar-user-email{font-size:12px;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:140px}
+.sidebar-user-role{font-size:9px;letter-spacing:1px;text-transform:uppercase;color:var(--muted);font-family:'DM Mono',monospace}
+.sidebar-signout{display:block;text-align:center;margin-top:8px;padding:8px;border-radius:8px;font-size:11px;
+                 font-family:'DM Mono',monospace;letter-spacing:1px;color:var(--muted);text-decoration:none;
+                 border:1px solid var(--border);transition:all .15s}
+.sidebar-signout:hover{color:var(--gold);border-color:var(--border-gold)}
+
+/* ── Topbar ── */
+.topbar{position:sticky;top:0;z-index:30;display:flex;align-items:center;gap:14px;
+        padding:0 28px;height:60px;background:rgba(10,10,13,.82);backdrop-filter:blur(12px);
+        border-bottom:1px solid var(--border)}
+.menu-btn{display:none;background:none;border:none;color:var(--text);cursor:pointer;padding:6px}
+.topbar-title{font-family:'Bebas Neue',sans-serif;font-size:26px;letter-spacing:.8px;color:var(--text);line-height:1}
+.topbar-right{margin-left:auto;display:flex;align-items:center;gap:16px}
+.topbar-user{font-size:12px;color:var(--muted);font-family:'DM Mono',monospace}
+.topbar-logout{font-size:11px;color:var(--muted);text-decoration:none;font-family:'DM Mono',monospace;letter-spacing:1px;transition:color .15s}
+.topbar-logout:hover{color:var(--gold)}
+
+/* ── Content ── */
+.content{padding:30px 28px 60px;max-width:1140px;width:100%}
+.page-head{display:flex;align-items:flex-end;justify-content:space-between;gap:16px;margin-bottom:24px;flex-wrap:wrap}
+.page-title{font-family:'Bebas Neue',sans-serif;font-size:34px;letter-spacing:.6px;color:var(--text);line-height:1}
+.page-sub{font-size:13px;color:var(--dim);margin-top:4px}
+.section-eyebrow{font-size:10px;letter-spacing:2px;text-transform:uppercase;color:var(--gold-d);font-family:'DM Mono',monospace;margin-bottom:10px}
+
+/* ── Buttons ── */
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;border:none;cursor:pointer;
+     border-radius:10px;padding:11px 18px;font-family:'DM Sans',sans-serif;font-weight:600;font-size:13px;
+     transition:transform .15s,box-shadow .2s,background .2s,border-color .2s;white-space:nowrap;text-decoration:none;line-height:1}
+.btn svg{width:15px;height:15px}
+.btn-gold{background:linear-gradient(180deg,var(--gold-l),var(--gold));color:#1a1408;box-shadow:0 6px 18px -8px rgba(209,175,98,.55)}
+.btn-gold:hover{transform:translateY(-1px);box-shadow:0 10px 24px -10px rgba(209,175,98,.65)}
+.btn-green{background:linear-gradient(180deg,#6bd39c,var(--green));color:#08230f;box-shadow:0 6px 18px -8px rgba(92,191,138,.5)}
+.btn-green:hover{transform:translateY(-1px)}
+.btn-ghost{background:var(--bg3);color:var(--text);border:1px solid var(--border)}
+.btn-ghost:hover{border-color:var(--border-gold);color:var(--gold)}
+.btn-danger{background:rgba(229,105,95,.12);color:var(--red);border:1px solid rgba(229,105,95,.28)}
+.btn-danger:hover{background:rgba(229,105,95,.22)}
+.btn-sm{padding:7px 12px;font-size:12px;border-radius:8px}
+.btn:disabled{opacity:.4;cursor:not-allowed;transform:none;box-shadow:none}
+
+/* ── Forms ── */
+label{font-size:10px;color:var(--muted);letter-spacing:1.5px;text-transform:uppercase;font-family:'DM Mono',monospace;display:block;margin-bottom:6px}
+input[type=text],input[type=number],input[type=email],input[type=password],input[type=url],select,textarea{
+  background:var(--bg3);border:1px solid var(--border);border-radius:10px;padding:11px 13px;color:var(--text);
+  font-family:'DM Sans',sans-serif;font-size:13px;outline:none;width:100%;transition:border-color .2s,box-shadow .2s;resize:vertical}
+input::placeholder,textarea::placeholder{color:#54515c}
+input:focus,select:focus,textarea:focus{border-color:var(--gold);box-shadow:0 0 0 3px rgba(209,175,98,.12)}
+select option{background:var(--bg3)}
+textarea{min-height:88px;line-height:1.55}
+.optional-tag{font-size:9px;color:var(--muted);opacity:.6;font-family:'DM Mono',monospace;margin-left:4px}
+
+/* ── Cards ── */
+.card{background:linear-gradient(180deg,var(--bg2),#101015);border:1px solid var(--border);border-radius:var(--radius);
+      overflow:hidden;margin-bottom:20px;box-shadow:var(--shadow)}
+.card-head{padding:17px 22px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:12px;background:rgba(255,255,255,.015)}
+.card-head-icon{width:32px;height:32px;border-radius:9px;flex-shrink:0;color:var(--gold);
+                background:linear-gradient(145deg,rgba(209,175,98,.16),rgba(209,175,98,.03));
+                border:1px solid var(--border-gold);display:flex;align-items:center;justify-content:center}
+.card-head-icon svg{width:16px;height:16px}
+.card-head-title{font-size:11px;letter-spacing:2px;color:var(--dim);text-transform:uppercase;font-family:'DM Mono',monospace;font-weight:500}
+.card-body{padding:22px}
+
+/* ── Stat cards (dashboard) ── */
+.stat-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-bottom:28px}
+.statcard{background:linear-gradient(180deg,var(--bg2),#101015);border:1px solid var(--border);border-radius:var(--radius);
+          padding:20px;box-shadow:var(--shadow);position:relative;overflow:hidden}
+.statcard-icon{width:34px;height:34px;border-radius:9px;color:var(--gold);margin-bottom:14px;
+               background:linear-gradient(145deg,rgba(209,175,98,.16),rgba(209,175,98,.03));
+               border:1px solid var(--border-gold);display:flex;align-items:center;justify-content:center}
+.statcard-icon svg{width:17px;height:17px}
+.statcard-value{font-family:'Bebas Neue',sans-serif;font-size:40px;line-height:1;color:var(--text)}
+.statcard-value .unit{font-size:16px;color:var(--muted);font-family:'DM Mono',monospace;margin-left:2px}
+.statcard-label{font-size:11px;color:var(--muted);letter-spacing:1px;text-transform:uppercase;font-family:'DM Mono',monospace;margin-top:6px}
+
+/* ── Badges ── */
+.badge{display:inline-flex;align-items:center;gap:5px;padding:3px 10px;border-radius:20px;font-size:10px;
+       font-family:'DM Mono',monospace;letter-spacing:.5px}
+.badge-gold{background:rgba(209,175,98,.12);color:var(--gold);border:1px solid var(--border-gold)}
+.badge-green{background:rgba(92,191,138,.12);color:var(--green);border:1px solid rgba(92,191,138,.3)}
+.badge-muted{background:rgba(255,255,255,.05);color:var(--dim);border:1px solid var(--border)}
+
+/* ── Empty state ── */
+.empty-state{text-align:center;padding:56px 20px;color:var(--muted)}
+.empty-state svg{width:40px;height:40px;opacity:.4;margin-bottom:14px}
+.empty-state h3{font-family:'DM Sans',sans-serif;font-size:16px;color:var(--dim);font-weight:600;margin-bottom:6px}
+.empty-state p{font-size:13px;color:var(--muted);margin-bottom:18px}
+.empty{color:var(--muted);font-size:13px;font-family:'DM Mono',monospace;padding:40px 0;text-align:center}
+
+/* ── Alerts / toast ── */
+.alert{border-radius:10px;padding:11px 16px;font-size:13px;margin-bottom:18px}
+.alert-success{background:rgba(92,191,138,.09);border:1px solid rgba(92,191,138,.28);color:var(--green)}
+.alert-error{background:rgba(229,105,95,.09);border:1px solid rgba(229,105,95,.28);color:var(--red)}
+.toast{position:fixed;bottom:24px;right:24px;background:var(--bg4);border:1px solid var(--border-gold);border-radius:11px;
+       padding:12px 20px;font-size:13px;color:var(--gold);font-family:'DM Mono',monospace;opacity:0;transform:translateY(8px);
+       transition:all .3s;z-index:999;pointer-events:none;box-shadow:0 16px 40px -18px rgba(0,0,0,.9)}
+.toast.show{opacity:1;transform:translateY(0)}
+.toast.err{color:var(--red);border-color:rgba(229,105,95,.35)}
+
+/* ── Mobile ── */
+.nav-scrim{display:none}
+@media(max-width:860px){
+  .app{grid-template-columns:1fr}
+  .sidebar{position:fixed;left:0;top:0;width:250px;transform:translateX(-100%);transition:transform .25s}
+  body.nav-open .sidebar{transform:translateX(0)}
+  body.nav-open .nav-scrim{display:block;position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:35}
+  .menu-btn{display:flex}
+  .topbar{padding:0 16px}
+  .content{padding:20px 16px 48px}
+  .stat-grid{grid-template-columns:1fr 1fr;gap:12px}
+}
+@media(max-width:520px){
+  .stat-grid{grid-template-columns:1fr}
+  .topbar-user{display:none}
+}
+"""
+
+# Page-specific component CSS (filter bar, review cards, upload, scores, chips, WP)
+PAGE_CSS = """
+/* Reviews list */
+.filter-bar{background:linear-gradient(180deg,var(--bg2),#101015);border:1px solid var(--border);border-radius:var(--radius);padding:20px 22px;margin-bottom:24px;box-shadow:var(--shadow)}
+.filter-row{display:flex;align-items:flex-end;gap:12px;flex-wrap:wrap}
+.filter-group{display:flex;flex-direction:column;gap:7px;min-width:140px;flex:1}
+.filter-group.search-group{flex:2;min-width:200px}
+.filter-label{font-size:10px;color:var(--muted);font-family:'DM Mono',monospace;letter-spacing:1px;text-transform:uppercase}
+.filter-select,.filter-input{width:100%;background:var(--bg3);border:1px solid var(--border);border-radius:9px;color:var(--text);padding:11px 13px;font-size:13px;outline:none;font-family:'DM Sans',sans-serif;transition:border-color .2s,box-shadow .2s}
+.filter-select{appearance:none;cursor:pointer;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1l5 5 5-5' stroke='%2378747f' stroke-width='1.5' fill='none' stroke-linecap='round'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 12px center;padding-right:32px}
+.filter-input::placeholder{color:#54515c}
+.filter-select:focus,.filter-input:focus{border-color:var(--gold);box-shadow:0 0 0 3px rgba(209,175,98,.12)}
+.filter-select.active{border-color:var(--border-gold);color:var(--gold)}
+.rating-group{display:flex;flex-direction:column;gap:7px;min-width:160px}
+.rating-filter{display:flex;align-items:center;gap:8px}
+.rating-filter input[type=range]{accent-color:var(--gold);flex:1;cursor:pointer;min-width:0}
+.rating-val{color:var(--gold);font-weight:600;font-size:12px;font-family:'DM Mono',monospace;white-space:nowrap;min-width:36px}
+.clear-btn{background:transparent;border:1px solid var(--border);border-radius:9px;color:var(--muted);padding:11px 16px;font-size:12px;font-family:'DM Mono',monospace;cursor:pointer;white-space:nowrap;transition:all .2s;align-self:flex-end}
+.clear-btn:hover{border-color:var(--border-gold);color:var(--gold)}
+.result-count{font-size:11px;font-family:'DM Mono',monospace;color:var(--muted);margin-top:14px}
+.review-grid{display:grid;gap:14px}
+.review-card{background:linear-gradient(180deg,var(--bg2),#101015);border:1px solid var(--border);border-radius:var(--radius);padding:20px 24px;cursor:pointer;transition:border-color .18s,transform .18s,box-shadow .18s;text-decoration:none;display:block;color:inherit}
+.review-card:hover{border-color:var(--border-gold);transform:translateY(-2px);box-shadow:0 16px 40px -22px rgba(0,0,0,.9)}
+.rc-top{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;margin-bottom:10px}
+.rc-title{font-size:16px;font-weight:600;color:var(--text);letter-spacing:.2px}
+.rc-director{font-size:12px;color:var(--dim);margin-top:3px}
+.rc-meta{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}
+.rc-tag{font-size:10px;font-family:'DM Mono',monospace;background:var(--bg4);border:1px solid var(--border);border-radius:6px;padding:3px 9px;color:var(--dim)}
+.rc-tag.festival{border-color:var(--border-gold);color:var(--gold);background:rgba(209,175,98,.06)}
+.rc-excerpt{font-size:12.5px;color:var(--dim);line-height:1.65;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.rc-date{font-size:11px;font-family:'DM Mono',monospace;color:var(--muted);white-space:nowrap}
+.rc-score{font-family:'Bebas Neue',sans-serif;font-size:26px;color:var(--gold);line-height:1}
+.rc-score .d{font-size:12px;color:var(--muted);font-family:'DM Mono',monospace}
+.no-results{display:none;color:var(--muted);font-size:13px;font-family:'DM Mono',monospace;padding:60px 0;text-align:center}
+
+/* Upload / new review */
+.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.form-group{display:flex;flex-direction:column;gap:7px}
+.form-group.full{grid-column:1/-1}
+.festival-hint{font-size:11px;color:var(--muted);margin-top:4px;font-family:'DM Mono',monospace;min-height:16px}
+.drop-zone{border:1.5px dashed var(--border-gold);border-radius:var(--radius);padding:44px 24px;text-align:center;cursor:pointer;transition:all .2s;position:relative;background:rgba(255,255,255,.015)}
+.drop-zone:hover{border-color:rgba(209,175,98,.4);background:rgba(209,175,98,.03)}
+.drop-zone.drag-over{border-color:var(--gold);background:rgba(209,175,98,.06)}
+.drop-zone.has-file{border-color:rgba(92,191,138,.45);background:rgba(92,191,138,.05)}
+.drop-icon{font-size:38px;margin-bottom:12px;opacity:.65}
+.drop-title{font-size:15px;font-weight:600;color:var(--text);margin-bottom:4px}
+.drop-sub{font-size:12px;color:var(--muted)}
+.file-info{font-size:12px;color:var(--green);font-family:'DM Mono',monospace;margin-top:8px;font-weight:500}
+input[type=file]{display:none}
+.submit-btn{width:100%;background:linear-gradient(180deg,var(--gold-l),var(--gold));color:#1a1408;border:none;border-radius:11px;padding:15px;font-family:'DM Sans',sans-serif;font-weight:700;font-size:15px;cursor:pointer;margin-top:4px;transition:transform .15s,box-shadow .2s;letter-spacing:.3px;box-shadow:0 8px 22px -8px rgba(209,175,98,.55)}
+.submit-btn:hover:not(:disabled){transform:translateY(-1px)}
+.submit-btn:disabled{opacity:.35;cursor:not-allowed;transform:none;box-shadow:none}
+.spinner{width:20px;height:20px;border:2px solid rgba(209,175,98,.2);border-top-color:var(--gold);border-radius:50%;animation:spin .8s linear infinite;flex-shrink:0}
+@keyframes spin{to{transform:rotate(360deg)}}
+.progress-card{display:none}.progress-card.active{display:block}
+.progress-status{display:flex;align-items:center;gap:12px;margin-bottom:16px}
+.progress-msg{font-size:13px;color:var(--text)}
+.progress-pct{font-family:'DM Mono',monospace;font-size:12px;color:var(--gold);margin-left:auto}
+.progress-track{height:4px;background:rgba(255,255,255,.06);border-radius:2px;overflow:hidden}
+.progress-fill{height:100%;background:linear-gradient(90deg,var(--gold-d),var(--gold),var(--gold-l));border-radius:2px;transition:width .4s ease;box-shadow:0 0 8px rgba(209,175,98,.4)}
+.step-list{display:flex;flex-direction:column;gap:8px;margin-top:16px}
+.step{display:flex;align-items:center;gap:10px;font-size:12px;color:var(--muted);font-family:'DM Mono',monospace}
+.step.active{color:var(--text)}.step.done{color:var(--green)}
+.step-dot{width:6px;height:6px;border-radius:50%;background:currentColor;flex-shrink:0}
+.results-card{display:none}.results-card.active{display:block}
+.scores-row{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:20px}
+.score-box{background:var(--bg3);border:1px solid var(--border);border-radius:11px;padding:14px;text-align:center}
+.score-box.overall{background:linear-gradient(160deg,rgba(209,175,98,.14),rgba(209,175,98,.03));border-color:var(--border-gold)}
+.score-label{font-size:9px;color:var(--muted);letter-spacing:1.5px;text-transform:uppercase;font-family:'DM Mono',monospace;display:block;margin-bottom:6px}
+.score-num{font-family:'Bebas Neue',sans-serif;font-size:34px;color:var(--gold);line-height:1}
+.score-denom{font-size:11px;color:var(--muted);font-family:'DM Mono',monospace}
+.obs-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:20px}
+.obs-item{background:var(--bg3);border:1px solid var(--border);border-radius:11px;padding:14px 16px}
+.obs-label{font-size:9px;color:var(--muted);letter-spacing:1.5px;text-transform:uppercase;font-family:'DM Mono',monospace;display:block;margin-bottom:5px}
+.obs-text{font-size:12.5px;color:var(--text);line-height:1.6}
+.standout{border-left:3px solid var(--gold);padding-left:12px}
+.weakest{border-left:3px solid rgba(229,105,95,.6);padding-left:12px}
+.review-block{background:var(--bg3);border:1px solid var(--border);border-radius:12px;padding:20px;position:relative}
+.review-text{font-size:14.5px;line-height:1.9;color:#dedbd3;white-space:pre-wrap}
+.copy-btn{position:absolute;top:12px;right:12px;background:rgba(209,175,98,.1);border:1px solid var(--border-gold);border-radius:8px;padding:6px 13px;color:var(--gold);font-size:11px;font-family:'DM Mono',monospace;cursor:pointer;transition:all .2s}
+.copy-btn:hover{background:rgba(209,175,98,.2)}.copy-btn.copied{color:var(--green);border-color:rgba(92,191,138,.35)}
+.new-btn{width:100%;background:transparent;border:1px solid var(--border);border-radius:11px;padding:13px;color:var(--dim);font-family:'DM Sans',sans-serif;font-size:14px;cursor:pointer;margin-top:12px;transition:all .2s}
+.new-btn:hover{border-color:var(--border-gold);color:var(--text)}
+.error-msg{background:rgba(229,105,95,.07);border:1px solid rgba(229,105,95,.25);border-radius:9px;padding:12px 16px;font-size:13px;color:#f0a09a;display:none}
+.error-msg.active{display:block}
+.film-tag{display:inline-flex;align-items:center;gap:6px;background:rgba(209,175,98,.07);border:1px solid var(--border-gold);border-radius:20px;padding:5px 13px;font-size:11px;color:var(--gold-l);font-family:'DM Mono',monospace;margin-bottom:16px}
+.library-picker{background:var(--bg3);border:1px solid var(--border-gold);border-radius:12px;padding:16px 18px;margin-bottom:20px}
+.library-label{font-size:10px;color:var(--gold-d);letter-spacing:2px;text-transform:uppercase;font-family:'DM Mono',monospace;margin-bottom:8px}
+.library-select{width:100%;background:var(--bg2);border:1px solid var(--border);border-radius:9px;padding:11px 13px;color:var(--text);font-family:'DM Sans',sans-serif;font-size:13px;outline:none}
+.library-hint{font-size:11px;color:var(--muted);font-family:'DM Mono',monospace;margin-top:6px;min-height:16px}
+.cache-badge{display:inline-flex;align-items:center;gap:5px;background:rgba(92,191,138,.1);border:1px solid rgba(92,191,138,.28);border-radius:6px;padding:3px 10px;font-size:11px;color:var(--green);font-family:'DM Mono',monospace;margin-top:6px}
+.link-input-wrap{display:flex;flex-direction:column;gap:8px}
+.link-hint{font-size:11px;color:var(--muted);font-family:'DM Mono',monospace}
+
+/* Publish (WordPress) actions on review screens */
+.publish-bar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:14px;padding-top:16px;border-top:1px solid var(--border)}
+.publish-bar .pb-label{font-size:11px;color:var(--muted);font-family:'DM Mono',monospace;letter-spacing:1px;text-transform:uppercase;margin-right:auto}
+.wp-status{font-size:12px;font-family:'DM Mono',monospace;color:var(--green);display:inline-flex;align-items:center;gap:6px}
+.wp-status a{color:var(--gold);text-decoration:underline}
+
+/* Manage chips + sections */
+.section{background:linear-gradient(180deg,var(--bg2),#101015);border:1px solid var(--border);border-radius:var(--radius);padding:26px 28px;margin-bottom:22px;box-shadow:var(--shadow)}
+.section-header{display:flex;align-items:center;gap:12px;margin-bottom:20px;padding-bottom:16px;border-bottom:1px solid var(--border)}
+.section-icon{width:34px;height:34px;border-radius:9px;background:linear-gradient(145deg,rgba(209,175,98,.16),rgba(209,175,98,.03));border:1px solid var(--border-gold);color:var(--gold);display:flex;align-items:center;justify-content:center;flex-shrink:0}
+.section-icon svg{width:17px;height:17px}
+.section-title{font-size:15px;font-weight:600;color:var(--text);letter-spacing:.2px}
+.chips{display:flex;flex-wrap:wrap;gap:8px;min-height:32px;margin-bottom:14px}
+.chip{display:inline-flex;align-items:center;gap:7px;background:var(--bg4);border:1px solid var(--border-gold);border-radius:8px;padding:5px 12px;font-size:12px;font-family:'DM Mono',monospace;color:var(--gold)}
+.chip-lbl{cursor:pointer}.chip-lbl:hover{color:var(--gold-l);text-decoration:underline dotted}
+.chip-del{cursor:pointer;color:var(--muted);font-size:15px;line-height:1;transition:color .15s}
+.chip-del:hover{color:var(--red)}
+.empty-chips{font-size:12px;color:var(--muted);font-family:'DM Mono',monospace;padding:6px 0}
+.add-row{display:flex;gap:10px}
+.add-row input{flex:1}
+.inline-edit{background:var(--bg3);border:1px solid rgba(209,175,98,.45);border-radius:5px;color:var(--text);padding:3px 8px;font-size:12px;font-family:'DM Mono',monospace;width:140px;outline:none}
+
+/* Admin tables */
+.form-row{display:grid;grid-template-columns:1fr 1fr auto auto;gap:12px;align-items:end}
+.user-table{width:100%;border-collapse:collapse}
+.user-table th{text-align:left;font-size:10px;color:var(--muted);letter-spacing:1.5px;text-transform:uppercase;font-family:'DM Mono',monospace;padding:0 0 12px;border-bottom:1px solid var(--border)}
+.user-table td{padding:14px 0;border-bottom:1px solid rgba(255,255,255,.05);font-size:13px;vertical-align:middle}
+.user-table tr:last-child td{border-bottom:none}
+.role-badge{display:inline-flex;align-items:center;padding:3px 11px;border-radius:20px;font-size:10px;font-family:'DM Mono',monospace;letter-spacing:1px;text-transform:uppercase}
+.role-admin{background:rgba(209,175,98,.14);color:var(--gold);border:1px solid var(--border-gold)}
+.role-user{background:rgba(255,255,255,.05);color:var(--dim);border:1px solid var(--border)}
+.section-label{font-size:10px;letter-spacing:1.5px;text-transform:uppercase;font-family:'DM Mono',monospace;color:var(--gold-d);margin-bottom:8px}
+.modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:100;align-items:center;justify-content:center;padding:20px}
+.modal-overlay.open{display:flex}
+.modal{background:var(--bg2);border:1px solid var(--border);border-radius:14px;max-width:680px;width:100%;padding:24px;max-height:88vh;overflow:auto}
+@media(max-width:640px){
+  .form-grid{grid-template-columns:1fr}
+  .form-row{grid-template-columns:1fr}
+  .obs-grid{grid-template-columns:1fr}
+  .scores-row{grid-template-columns:1fr 1fr}
+  .filter-row{flex-direction:column}
+  .filter-group,.rating-group{min-width:0;width:100%}
+  .clear-btn{width:100%}
+  .add-row{flex-wrap:wrap}
+}
+
+/* Review detail page */
+.back{display:inline-flex;align-items:center;gap:6px;color:var(--muted);text-decoration:none;font-size:12px;font-family:'DM Mono',monospace;margin-bottom:22px;transition:color .15s}
+.back:hover{color:var(--gold)}
+.film-header{margin-bottom:24px}
+.film-title{font-family:'Bebas Neue',sans-serif;font-size:40px;line-height:1;color:var(--text);letter-spacing:.5px;margin-bottom:8px}
+.film-director{font-size:14px;color:var(--dim);margin-bottom:16px}
+.film-meta{display:flex;gap:8px;flex-wrap:wrap}
+.meta-tag{font-size:11px;font-family:'DM Mono',monospace;background:var(--bg3);border:1px solid var(--border);border-radius:6px;padding:4px 11px;color:var(--dim)}
+.review-block-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:22px;padding-bottom:16px;border-bottom:1px solid var(--border)}
+.festival-badge{font-size:11px;font-family:'DM Mono',monospace;background:rgba(209,175,98,.09);border:1px solid var(--border-gold);border-radius:6px;padding:4px 11px;color:var(--gold)}
+.review-date{font-size:11px;font-family:'DM Mono',monospace;color:var(--muted)}
+.section-divider{font-size:10px;font-family:'DM Mono',monospace;text-transform:uppercase;letter-spacing:2px;color:var(--gold-d);margin:24px 0 14px}
+.score-box .lbl{display:block;font-size:9.5px;font-family:'DM Mono',monospace;color:var(--muted);text-transform:uppercase;letter-spacing:1px;margin-bottom:8px}
+.score-box .num{font-family:'Bebas Neue',sans-serif;font-size:30px;line-height:1;color:var(--text)}
+.score-box.overall .num{color:var(--gold)}
+.score-box .den{font-size:11px;color:var(--muted);font-family:'DM Mono',monospace}
+.obs-item .obs-lbl{display:block;font-size:10px;font-family:'DM Mono',monospace;text-transform:uppercase;letter-spacing:1px;color:var(--muted);margin-bottom:6px}
+.obs-item.standout .obs-lbl{color:var(--green)}
+.obs-item.weakest .obs-lbl{color:#e5965f}
+.obs-item.weakest{border-color:rgba(229,150,95,.32)}
+.obs-item.standout{border-color:rgba(92,191,138,.32)}
+.obs-item .obs-body{font-size:13px;line-height:1.65;color:var(--text)}
+
+/* Button aliases / manage add button */
+.btn-red{background:rgba(229,105,95,.12);color:var(--red);border:1px solid rgba(229,105,95,.28);border-radius:8px;padding:8px 14px;font-family:'DM Sans',sans-serif;font-weight:600;font-size:12px;cursor:pointer;transition:all .2s}
+.btn-red:hover{background:rgba(229,105,95,.22)}
+.add-btn{background:linear-gradient(180deg,var(--gold-l),var(--gold));color:#1a1408;border:none;border-radius:9px;padding:11px 20px;font-size:13px;font-weight:600;cursor:pointer;white-space:nowrap;transition:transform .15s;box-shadow:0 5px 16px -6px rgba(209,175,98,.5)}
+.add-btn:hover{transform:translateY(-1px)}
+.main{width:100%}
+"""
+
+# ── Inline icons (used in the sidebar, topbar, stat cards) ─────────────────────
+def _svg(path):
+    return ('<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" '
+            'stroke-linecap="round" stroke-linejoin="round">' + path + '</svg>')
+
+ICONS = {
+    "logo":      _svg('<path d="M2 6l4 3-2.5 3M22 6l-4 3 2.5 3M8 4l2 3-2 3M16 4l-2 3 2 3"/><rect x="3" y="12" width="18" height="8" rx="2"/>'),
+    "dashboard": _svg('<rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/>'),
+    "new":       _svg('<rect x="2" y="4" width="20" height="16" rx="2"/><path d="M7 4v16M17 4v16M2 9h5M2 15h5M17 9h5M17 15h5"/>'),
+    "reviews":   _svg('<path d="M4 4h16v13H8l-4 3z"/><path d="M8 9h8M8 12.5h5"/>'),
+    "manage":    _svg('<path d="M3 6h18M3 12h18M3 18h18"/><circle cx="8" cy="6" r="2" fill="currentColor" stroke="none"/><circle cx="16" cy="12" r="2" fill="currentColor" stroke="none"/><circle cx="9" cy="18" r="2" fill="currentColor" stroke="none"/>'),
+    "wordpress": _svg('<circle cx="12" cy="12" r="10"/><path d="M4 9h9a2.5 2.5 0 0 1 0 5H9l3 6M8 5l6 14"/>'),
+    "admin":     _svg('<path d="M12 2 4 6v6c0 5 3.4 8.5 8 10 4.6-1.5 8-5 8-10V6z"/><path d="M9 12l2 2 4-4"/>'),
+    "star":      _svg('<path d="M12 3l2.6 5.3 5.9.9-4.3 4.1 1 5.8L12 16.9 6.8 19.2l1-5.8L3.5 9.2l5.9-.9z"/>'),
+    "published": _svg('<path d="M4 4h16v13H8l-4 3z"/><path d="m9 10 2 2 4-4"/>'),
+    "calendar":  _svg('<rect x="3" y="4" width="18" height="18" rx="2"/><path d="M3 9h18M8 2v4M16 2v4"/>'),
+    "menu":      _svg('<path d="M3 6h18M3 12h18M3 18h18"/>'),
+}
+
+# Sidebar nav definition: (key, label, href, icon, admin_only)
+NAV_ITEMS = [
+    ("dashboard", "Dashboard",  "/dashboard", "dashboard", False),
+    ("new",       "New Review", "/new",       "new",       "user_only"),
+    ("reviews",   "Reviews",    "/reviews",   "reviews",   False),
+    ("manage",    "Manage",     "/manage",    "manage",    False),
+    ("wordpress", "WordPress",  "/wordpress", "wordpress", True),
+    ("admin",     "Admin",      "/admin",     "admin",     True),
+]
+
+
+def _sidebar(active: str) -> str:
+    items = []
+    for key, label, href, icon, gate in NAV_ITEMS:
+        cls = "nav-item active" if key == active else "nav-item"
+        link = ('<a href="' + href + '" class="' + cls + '">' + ICONS[icon]
+                + '<span>' + label + '</span></a>')
+        if gate is True:            # admin only
+            link = "{% if session.get('role') == 'admin' %}" + link + "{% endif %}"
+        elif gate == "user_only":   # hide from admins
+            link = "{% if session.get('role') != 'admin' %}" + link + "{% endif %}"
+        items.append(link)
+    nav = "".join(items)
+    return (
+        '<aside class="sidebar">'
+        '<div class="brand"><div class="brand-mark">' + ICONS["logo"] + '</div>'
+        '<div><div class="brand-name">Festival Reviewer</div>'
+        '<div class="brand-sub">Expert Review Studio</div></div></div>'
+        '<nav class="sidebar-nav">' + nav + '</nav>'
+        '<div class="sidebar-foot"><div class="sidebar-user">'
+        '<div class="avatar">{{ (session.get("user","?")[:1])|upper }}</div>'
+        '<div class="sidebar-user-meta">'
+        '<div class="sidebar-user-email">{{ session.get("user","") }}</div>'
+        '<div class="sidebar-user-role">{{ session.get("role","user") }}</div>'
+        '</div></div>'
+        '<a href="/logout" class="sidebar-signout">Sign out</a></div>'
+        '</aside>'
+    )
+
+
+SHELL_HEAD = (
+    '<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
+    '<link rel="preconnect" href="https://fonts.googleapis.com">'
+    '<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>'
+    '<link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&'
+    'family=DM+Sans:ital,wght@0,300;0,400;0,500;0,600;0,700;1,300&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">'
+    '<style>' + SHELL_CSS + PAGE_CSS + '</style>'
+)
+
+
+def _shell(active: str, title: str, body: str) -> str:
+    """Wrap a page body in the app shell (sidebar + topbar). Returns a Jinja
+    template string to be rendered with render_template_string(..., **ctx)."""
+    return (
+        '<!DOCTYPE html><html lang="en"><head>'
+        '<title>' + title + ' — Festival Reviewer</title>'
+        + SHELL_HEAD +
+        '</head><body>'
+        '<div class="app">'
+        + _sidebar(active) +
+        '<div class="main-col">'
+        '<header class="topbar">'
+        '<button class="menu-btn" onclick="document.body.classList.toggle(\'nav-open\')" aria-label="Menu">'
+        + ICONS["menu"] + '</button>'
+        '<div class="topbar-title">' + title + '</div>'
+        '<div class="topbar-right"><span class="topbar-user">{{ session.get("user","") }}</span>'
+        '<a href="/logout" class="topbar-logout">Sign out</a></div>'
+        '</header>'
+        '<main class="content">' + body + '</main>'
+        '</div>'
+        '<div class="nav-scrim" onclick="document.body.classList.remove(\'nav-open\')"></div>'
+        '</div></body></html>'
+    )
+
+
+def render_page(active, title, body, **ctx):
+    return render_template_string(_shell(active, title, body), **ctx)
+
+
 # ── HTML ──────────────────────────────────────────────────
+DASHBOARD_BODY = """
+<div class="page-head">
+  <div>
+    <div class="section-eyebrow">Overview</div>
+    <div class="page-sub" style="margin-top:0">{{ scope_name }}</div>
+  </div>
+  {% if not is_admin %}
+  <a href="/new" class="btn btn-gold">""" + ICONS["new"] + """ New Review</a>
+  {% endif %}
+</div>
+
+<div class="stat-grid">
+  <div class="statcard">
+    <div class="statcard-icon">""" + ICONS["reviews"] + """</div>
+    <div class="statcard-value">{{ stats.total }}</div>
+    <div class="statcard-label">Total Reviews</div>
+  </div>
+  <div class="statcard">
+    <div class="statcard-icon">""" + ICONS["star"] + """</div>
+    <div class="statcard-value">{{ stats.avg }}{% if stats.avg != '—' %}<span class="unit">/10</span>{% endif %}</div>
+    <div class="statcard-label">Average Rating</div>
+  </div>
+  <div class="statcard">
+    <div class="statcard-icon">""" + ICONS["published"] + """</div>
+    <div class="statcard-value">{{ stats.published }}</div>
+    <div class="statcard-label">Published to WP</div>
+  </div>
+  <div class="statcard">
+    <div class="statcard-icon">""" + ICONS["calendar"] + """</div>
+    <div class="statcard-value">{{ stats.seasons }}</div>
+    <div class="statcard-label">Seasons</div>
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-head">
+    <div class="card-head-icon">""" + ICONS["reviews"] + """</div>
+    <div class="card-head-title">Recent Reviews</div>
+    <a href="/reviews" class="btn btn-ghost btn-sm" style="margin-left:auto">View all</a>
+  </div>
+  <div class="card-body" style="padding:8px 0">
+    {% if reviews %}
+    <table class="user-table" style="width:100%">
+      <tbody>
+      {% for r in reviews %}
+        <tr onclick="location.href='/reviews/{{ r.film_id }}'" style="cursor:pointer">
+          <td style="padding-left:22px">
+            <div style="font-weight:600;color:var(--text)">{{ r.title }}</div>
+            <div style="font-size:12px;color:var(--dim)">{{ r.director }}</div>
+          </td>
+          <td style="color:var(--dim);font-family:'DM Mono',monospace;font-size:11px">{{ r.festival_name }}</td>
+          <td>{% if r.season %}<span class="badge badge-muted">{{ r.season }}</span>{% endif %}</td>
+          <td style="text-align:right">
+            {% if r.overall_rating not in (None, '') %}
+            <span class="rc-score">{{ '%.1f'|format(r.overall_rating|float) }}<span class="d">/10</span></span>
+            {% endif %}
+          </td>
+          <td style="text-align:right;padding-right:22px">
+            {% if r.wp_post_id %}<span class="badge badge-green">Published</span>{% endif %}
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <div class="empty-state">
+      """ + ICONS["reviews"] + """
+      <h3>No reviews yet</h3>
+      <p>Generate your first expert review to see it here.</p>
+      {% if not is_admin %}<a href="/new" class="btn btn-gold">Create a review</a>{% endif %}
+    </div>
+    {% endif %}
+  </div>
+</div>
+"""
+
+
+WORDPRESS_BODY = """
+<div class="page-head">
+  <div>
+    <div class="section-eyebrow">Integration</div>
+    <div class="page-sub" style="margin-top:0">Connect each festival to its WordPress site and design how published reviews look.</div>
+  </div>
+</div>
+
+{% if not festivals %}
+<div class="empty-state">
+  <h3>No festivals yet</h3>
+  <p>Create a festival in the Admin panel first, then configure WordPress here.</p>
+  <a href="/admin" class="btn btn-gold">Go to Admin</a>
+</div>
+{% endif %}
+
+{% for key, f in festivals.items() %}
+<div class="card">
+  <div class="card-head">
+    <div class="card-head-icon">""" + ICONS["wordpress"] + """</div>
+    <div class="card-head-title">{{ f.name }}</div>
+    <span class="badge {{ 'badge-green' if f.wp_configured else 'badge-muted' }}" id="wpchip-{{ key }}" style="margin-left:auto">
+      {{ 'Connected' if f.wp_configured else 'Not connected' }}
+    </span>
+  </div>
+  <div class="card-body">
+    <div class="section-label">Connection</div>
+    <div class="form-grid" style="margin-bottom:14px">
+      <div class="form-group">
+        <label>WordPress Site URL</label>
+        <input type="url" id="wpurl-{{ key }}" value="{{ f.wp_url }}" placeholder="https://yourfestival.com">
+      </div>
+      <div class="form-group">
+        <label>WordPress Username</label>
+        <input type="text" id="wpuser-{{ key }}" value="{{ f.wp_user }}" placeholder="editor">
+      </div>
+      <div class="form-group">
+        <label>Application Password</label>
+        <input type="password" id="wppass-{{ key }}" autocomplete="new-password"
+               placeholder="{{ '•••••• saved — leave blank to keep' if f.wp_configured else 'xxxx xxxx xxxx xxxx' }}">
+      </div>
+      <div class="form-group">
+        <label>Default Publish Mode</label>
+        <select id="wpstatus-{{ key }}">
+          <option value="draft" {{ 'selected' if f.wp_default_status != 'publish' else '' }}>Draft</option>
+          <option value="publish" {{ 'selected' if f.wp_default_status == 'publish' else '' }}>Publish live</option>
+        </select>
+      </div>
+    </div>
+    <div style="font-size:11px;color:var(--muted);font-family:'DM Mono',monospace;line-height:1.6;margin-bottom:14px">
+      In WordPress: <strong style="color:var(--gold)">Users → Profile → Application Passwords</strong> → add one, paste it here. Stored encrypted server-side and never shown again.
+    </div>
+    <button class="btn btn-gold btn-sm" onclick="wpSaveConfig('{{ key }}')">Save connection</button>
+
+    <div class="section-label" style="margin-top:26px">Reference Design → Template</div>
+    <div style="font-size:12px;color:var(--dim);line-height:1.6;margin-bottom:12px">
+      Paste a sample post URL or its HTML, and generate a reusable template. Every review published to this festival's site is rendered into it.
+    </div>
+    <div class="form-grid" style="margin-bottom:12px">
+      <div class="form-group">
+        <label>Reference post URL <span class="optional-tag">optional</span></label>
+        <input type="url" id="wpref-{{ key }}" placeholder="https://yourfestival.com/a-past-review">
+      </div>
+      <div class="form-group">
+        <label>…or paste reference HTML <span class="optional-tag">optional</span></label>
+        <textarea id="wprefhtml-{{ key }}" style="min-height:44px" placeholder="<div>…</div>"></textarea>
+      </div>
+    </div>
+    <button class="btn btn-ghost btn-sm" onclick="wpGen('{{ key }}')" id="wpgenbtn-{{ key }}">✨ Generate template</button>
+
+    <div class="form-group" style="margin-top:18px">
+      <label>Template HTML <span class="optional-tag">uses {{ '{{title}}' }}, {{ '{{review_body}}' }}, {{ '{{scores_table}}' }}…</span></label>
+      <textarea id="wptpl-{{ key }}" style="min-height:180px;font-family:'DM Mono',monospace;font-size:12px">{{ f.wp_template }}</textarea>
+    </div>
+    <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:4px">
+      <button class="btn btn-gold btn-sm" onclick="wpSaveTpl('{{ key }}')">Save template</button>
+      <button class="btn btn-ghost btn-sm" onclick="wpPreview('{{ key }}')">Preview</button>
+    </div>
+    <div style="margin-top:14px;display:flex;flex-wrap:wrap;gap:6px">
+      {% for p in placeholders %}<span class="rc-tag">{{ '{{' }}{{ p }}{{ '}}' }}</span>{% endfor %}
+    </div>
+  </div>
+</div>
+{% endfor %}
+
+<!-- Preview modal -->
+<div class="modal-overlay" id="wpPreviewModal">
+  <div class="modal" style="max-width:820px">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px">
+      <div class="card-head-title">Publish Preview</div>
+      <button class="btn btn-ghost btn-sm" onclick="document.getElementById('wpPreviewModal').classList.remove('open')">Close</button>
+    </div>
+    <iframe id="wpPreviewFrame" style="width:100%;height:60vh;border:1px solid var(--border);border-radius:10px;background:#fff"></iframe>
+  </div>
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+function wpToast(msg, err){const t=document.getElementById('toast');t.textContent=msg;t.className='toast show'+(err?' err':'');clearTimeout(t._t);t._t=setTimeout(()=>t.className='toast',3000);}
+function wpJSON(url, method, body){return fetch(url,{method:method,headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})}).then(r=>r.json().then(d=>({ok:r.ok,d:d})));}
+
+function wpSaveConfig(key){
+  const body={wp_url:val('wpurl-'+key),wp_user:val('wpuser-'+key),wp_app_pass:val('wppass-'+key),wp_default_status:val('wpstatus-'+key)};
+  wpJSON('/api/festivals/'+key+'/wp/config','POST',body).then(({ok,d})=>{
+    if(!ok){wpToast(d.error||'Save failed',true);return;}
+    document.getElementById('wppass-'+key).value='';
+    const chip=document.getElementById('wpchip-'+key);
+    chip.textContent=d.wp_configured?'Connected':'Not connected';
+    chip.className='badge '+(d.wp_configured?'badge-green':'badge-muted');
+    wpToast('Connection saved');
+  });
+}
+function wpGen(key){
+  const btn=document.getElementById('wpgenbtn-'+key);const old=btn.textContent;btn.textContent='Generating…';btn.disabled=true;
+  wpJSON('/api/festivals/'+key+'/wp/template/generate','POST',{reference_url:val('wpref-'+key),reference_html:val('wprefhtml-'+key)}).then(({ok,d})=>{
+    btn.textContent=old;btn.disabled=false;
+    if(!ok){wpToast(d.error||'Generation failed',true);return;}
+    document.getElementById('wptpl-'+key).value=d.template;
+    wpToast('Template generated — review it, then Save');
+  });
+}
+function wpSaveTpl(key){
+  wpJSON('/api/festivals/'+key+'/wp/template','PUT',{template:val('wptpl-'+key)}).then(({ok,d})=>{
+    wpToast(ok?'Template saved':(d.error||'Save failed'),!ok);
+  });
+}
+function wpPreview(key){
+  wpJSON('/api/festivals/'+key+'/wp/preview','POST',{template:val('wptpl-'+key)}).then(({ok,d})=>{
+    if(!ok){wpToast(d.error||'Preview failed',true);return;}
+    document.getElementById('wpPreviewFrame').srcdoc='<body style=\"margin:0;padding:24px;background:#fff\">'+d.html+'</body>';
+    document.getElementById('wpPreviewModal').classList.add('open');
+  });
+}
+function val(id){const el=document.getElementById(id);return el?el.value:'';}
+</script>
+"""
+
+
 LOGIN_HTML = """<!DOCTYPE html>
 <html><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -1841,93 +2692,8 @@ function togglePw() {
 </body></html>"""
 
 
-ADMIN_HTML = """<!DOCTYPE html>
-<html><head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Admin — User Management</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=DM+Sans:wght@300;400;500;600;700&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
-<style>
-*{margin:0;padding:0;box-sizing:border-box}
-:root{--gold:#d1af62;--gold-l:#ecca86;--gold-d:#a2854a;
-      --bg:#0a0a0d;--bg2:#141419;--bg3:#1c1c24;--bg4:#24242e;
-      --border:rgba(255,255,255,.08);--border-gold:rgba(209,175,98,.22);
-      --text:#eceae4;--dim:#a29e96;--muted:#78747f;
-      --green:#5cbf8a;--red:#e5695f}
-body{background:var(--bg);color:var(--text);font-family:'DM Sans',sans-serif;min-height:100vh;
-     background-image:radial-gradient(ellipse 90% 40% at 50% -5%,rgba(209,175,98,.06),transparent 70%)}
-::selection{background:rgba(209,175,98,.28);color:#fff}
-.header{background:rgba(16,16,21,.85);backdrop-filter:blur(12px);border-bottom:1px solid var(--border);
-        padding:14px 28px;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:20}
-.header-logo{font-family:'Bebas Neue',sans-serif;font-size:22px;color:var(--gold);letter-spacing:2px}
-.header-right{display:flex;align-items:center;gap:18px}
-.nav-link{font-size:11px;color:var(--muted);text-decoration:none;font-family:'DM Mono',monospace;
-          letter-spacing:1px;transition:color .2s}
-.nav-link:hover,.nav-link.active{color:var(--gold)}
-.main{max-width:820px;margin:0 auto;padding:40px 20px}
-.page-title{font-family:'Bebas Neue',sans-serif;font-size:44px;color:var(--gold);letter-spacing:1px;margin-bottom:2px;line-height:1}
-.page-sub{font-size:13px;color:var(--dim);margin-bottom:30px}
-.card{background:linear-gradient(180deg,var(--bg2),#101015);border:1px solid var(--border);border-radius:16px;overflow:hidden;margin-bottom:20px;box-shadow:0 12px 40px -24px rgba(0,0,0,.8)}
-.card-head{padding:16px 24px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:12px;background:rgba(255,255,255,.015)}
-.card-head-icon{width:32px;height:32px;border-radius:9px;background:linear-gradient(145deg,rgba(209,175,98,.16),rgba(209,175,98,.03));
-                border:1px solid var(--border-gold);color:var(--gold);
-                display:flex;align-items:center;justify-content:center;flex-shrink:0}
-.card-head-icon svg{width:16px;height:16px}
-.card-head-title{font-size:11px;letter-spacing:2px;color:var(--dim);text-transform:uppercase;
-                 font-family:'DM Mono',monospace;font-weight:500}
-.card-body{padding:22px 24px}
-.form-row{display:grid;grid-template-columns:1fr 1fr auto auto;gap:12px;align-items:end}
-label{font-size:10px;color:var(--muted);letter-spacing:1.5px;text-transform:uppercase;
-      font-family:'DM Mono',monospace;display:block;margin-bottom:6px}
-input,select{background:var(--bg3);border:1px solid var(--border);border-radius:9px;
-             padding:11px 13px;color:var(--text);font-family:'DM Sans',sans-serif;
-             font-size:13px;outline:none;width:100%;transition:border-color .2s,box-shadow .2s}
-input::placeholder{color:#54515c}
-input:focus,select:focus{border-color:var(--gold);box-shadow:0 0 0 3px rgba(209,175,98,.12)}
-select option{background:var(--bg3)}
-.btn{border:none;border-radius:9px;padding:11px 18px;font-family:'DM Sans',sans-serif;
-     font-weight:600;font-size:13px;cursor:pointer;transition:transform .15s,background .2s,box-shadow .2s;white-space:nowrap}
-.btn-gold{background:linear-gradient(180deg,var(--gold-l),var(--gold));color:#1a1408;box-shadow:0 5px 16px -6px rgba(209,175,98,.5)}
-.btn-gold:hover{transform:translateY(-1px);box-shadow:0 9px 22px -8px rgba(209,175,98,.6)}
-.btn-red{background:rgba(229,105,95,.12);color:var(--red);border:1px solid rgba(229,105,95,.28)}
-.btn-red:hover{background:rgba(229,105,95,.22)}
-.user-table{width:100%;border-collapse:collapse}
-.user-table th{text-align:left;font-size:10px;color:var(--muted);letter-spacing:1.5px;
-               text-transform:uppercase;font-family:'DM Mono',monospace;padding:0 0 12px;
-               border-bottom:1px solid var(--border)}
-.user-table td{padding:14px 0;border-bottom:1px solid rgba(255,255,255,.05);
-               font-size:13px;vertical-align:middle}
-.user-table tr:last-child td{border-bottom:none}
-.role-badge{display:inline-flex;align-items:center;padding:3px 11px;border-radius:20px;
-            font-size:10px;font-family:'DM Mono',monospace;letter-spacing:1px;text-transform:uppercase}
-.role-admin{background:rgba(209,175,98,.14);color:var(--gold);border:1px solid var(--border-gold)}
-.role-user{background:rgba(255,255,255,.05);color:var(--dim);border:1px solid rgba(255,255,255,.08)}
-.alert{border-radius:10px;padding:11px 16px;font-size:13px;margin-bottom:18px}
-.alert-success{background:rgba(92,191,138,.09);border:1px solid rgba(92,191,138,.28);color:var(--green)}
-.alert-error{background:rgba(229,105,95,.09);border:1px solid rgba(229,105,95,.28);color:var(--red)}
-.empty{color:var(--muted);font-size:13px;font-family:'DM Mono',monospace;padding:16px 0}
-.section-label{font-size:10px;letter-spacing:1.5px;text-transform:uppercase;font-family:'DM Mono',monospace;color:var(--gold-d);margin-bottom:8px}
-@media(max-width:700px){
-  .main{padding:20px 12px}
-  .form-row{grid-template-columns:1fr!important}
-  .header{padding:12px 16px}
-  .header-right{gap:10px}
-  .card-body{padding:16px}
-  .user-table th:nth-child(3),.user-table td:nth-child(3),
-  .user-table th:nth-child(4),.user-table td:nth-child(4){display:none}
-}
-</style></head><body>
-<div class="header">
-  <div class="header-logo">Festival Reviewer</div>
-  <div class="header-right">
-    <a href="/" class="nav-link">← Back to Reviews</a>
-    <a href="/logout" class="nav-link">Sign out</a>
-  </div>
-</div>
-<div class="main">
-  <div class="page-title">User Management</div>
-  <div class="page-sub">Add and remove portal users. Admins can access this panel.</div>
+ADMIN_BODY = """<div class="main">
+  <div class="page-sub" style="margin-bottom:24px">Add and remove portal users, and configure festivals.</div>
 
   {% set msg_success = request.args.get('success') %}
   {% set msg_error   = request.args.get('error') %}
@@ -2387,104 +3153,11 @@ document.querySelectorAll('details').forEach(det => {
   });
 });
 </script>
-</body></html>"""
+"""
 
 
-REVIEWS_HTML = """<!DOCTYPE html>
-<html><head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Past Reviews</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=DM+Sans:wght@300;400;500;600;700&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-:root{--bg:#0a0a0d;--bg2:#141419;--bg3:#1c1c24;--bg4:#24242e;--border:rgba(255,255,255,.08);
-      --border-gold:rgba(209,175,98,.22);--text:#eceae4;--dim:#a29e96;--muted:#78747f;
-      --gold:#d1af62;--gold2:#ecca86;--red:#e5695f}
-body{background:var(--bg);color:var(--text);font-family:'DM Sans',sans-serif;min-height:100vh;
-     background-image:radial-gradient(ellipse 90% 40% at 50% -5%,rgba(209,175,98,.06),transparent 70%)}
-::selection{background:rgba(209,175,98,.28);color:#fff}
-.header{display:flex;align-items:center;justify-content:space-between;padding:14px 32px;
-        border-bottom:1px solid var(--border);background:rgba(16,16,21,.85);backdrop-filter:blur(12px);position:sticky;top:0;z-index:20}
-.header-logo{font-family:'Bebas Neue',sans-serif;font-size:22px;color:var(--gold);letter-spacing:2px}
-.header-right{display:flex;gap:18px;align-items:center}
-.nav-link{color:var(--muted);text-decoration:none;font-size:11px;font-family:'DM Mono',monospace;letter-spacing:1px;transition:color .15s}
-.nav-link:hover{color:var(--gold)}
-.main{max-width:1100px;margin:0 auto;padding:40px 24px}
-.page-title{font-family:'Bebas Neue',sans-serif;font-size:44px;color:var(--gold);letter-spacing:1px;margin-bottom:2px;line-height:1}
-.page-sub{color:var(--dim);font-size:13px;margin-bottom:26px;font-family:'DM Mono',monospace}
-
-/* ── Filter bar ── */
-.filter-bar{background:linear-gradient(180deg,var(--bg2),#101015);border:1px solid var(--border);border-radius:14px;padding:20px 22px;margin-bottom:26px;box-shadow:0 12px 40px -24px rgba(0,0,0,.8)}
-.filter-row{display:flex;align-items:flex-end;gap:12px;flex-wrap:wrap}
-.filter-group{display:flex;flex-direction:column;gap:7px;min-width:140px;flex:1}
-.filter-group.search-group{flex:2;min-width:200px}
-.filter-label{font-size:10px;color:var(--muted);font-family:'DM Mono',monospace;letter-spacing:1px;text-transform:uppercase}
-.filter-select,.filter-input{width:100%;background:var(--bg3);border:1px solid var(--border);border-radius:9px;
-                              color:var(--text);padding:11px 13px;font-size:13px;outline:none;
-                              font-family:'DM Sans',sans-serif;cursor:pointer;transition:border-color .2s,box-shadow .2s;appearance:none;
-                              background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1l5 5 5-5' stroke='%2378747f' stroke-width='1.5' fill='none' stroke-linecap='round'/%3E%3C/svg%3E");
-                              background-repeat:no-repeat;background-position:right 12px center;padding-right:32px}
-.filter-input{background-image:none;padding-right:13px;cursor:text}
-.filter-input::placeholder{color:#54515c}
-.filter-select:focus,.filter-input:focus{border-color:var(--gold);box-shadow:0 0 0 3px rgba(209,175,98,.12)}
-.filter-select.active{border-color:var(--border-gold);color:var(--gold)}
-.rating-group{display:flex;flex-direction:column;gap:7px;min-width:160px}
-.rating-filter{display:flex;align-items:center;gap:8px}
-.rating-filter input[type=range]{accent-color:var(--gold);flex:1;cursor:pointer;min-width:0}
-.rating-val{color:var(--gold);font-weight:600;font-size:12px;font-family:'DM Mono',monospace;white-space:nowrap;min-width:36px}
-.clear-btn{background:transparent;border:1px solid var(--border);border-radius:9px;color:var(--muted);
-           padding:11px 16px;font-size:12px;font-family:'DM Mono',monospace;cursor:pointer;white-space:nowrap;
-           transition:all .2s;align-self:flex-end;flex-shrink:0}
-.clear-btn:hover{border-color:var(--border-gold);color:var(--gold)}
-.result-count{font-size:11px;font-family:'DM Mono',monospace;color:var(--muted);margin-top:14px}
-
-/* ── Cards ── */
-.review-grid{display:grid;gap:14px}
-.review-card{background:linear-gradient(180deg,var(--bg2),#101015);border:1px solid var(--border);border-radius:14px;
-             padding:20px 24px;cursor:pointer;transition:border-color .18s,transform .18s,box-shadow .18s;
-             text-decoration:none;display:block;color:inherit;position:relative}
-.review-card:hover{border-color:var(--border-gold);transform:translateY(-2px);box-shadow:0 16px 40px -22px rgba(0,0,0,.9)}
-.rc-top{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;margin-bottom:10px}
-.rc-title{font-size:16px;font-weight:600;color:var(--text);letter-spacing:.2px}
-.rc-director{font-size:12px;color:var(--dim);margin-top:3px}
-.rc-meta{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}
-.rc-tag{font-size:10px;font-family:'DM Mono',monospace;background:var(--bg4);
-        border:1px solid var(--border);border-radius:6px;padding:3px 9px;color:var(--dim)}
-.rc-tag.festival{border-color:var(--border-gold);color:var(--gold);background:rgba(209,175,98,.06)}
-.rc-excerpt{font-size:12.5px;color:var(--dim);line-height:1.65;
-            display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
-.rc-date{font-size:11px;font-family:'DM Mono',monospace;color:var(--muted);white-space:nowrap}
-.empty{color:var(--muted);font-size:13px;font-family:'DM Mono',monospace;padding:60px 0;text-align:center}
-.no-results{display:none;color:var(--muted);font-size:13px;font-family:'DM Mono',monospace;
-            padding:60px 0;text-align:center}
-@media(max-width:640px){
-  .header{padding:10px 14px}
-  .main{padding:20px 12px}
-  .filter-bar{padding:14px}
-  .filter-row{flex-direction:column;gap:10px}
-  .filter-group,.rating-group{min-width:0;width:100%}
-  .filter-group.search-group{flex:unset}
-  .clear-btn{width:100%}
-  .review-card{padding:16px}
-  .rc-date{display:none}
-}
-</style>
-</head><body>
-<div class="header">
-  <div class="header-logo">Festival Reviewer</div>
-  <div class="header-right">
-    <a href="/" class="nav-link">Submit</a>
-    <a href="/manage" class="nav-link">Manage</a>
-    {% if user_role == 'admin' %}<a href="/admin" class="nav-link" style="color:var(--gold)">Admin</a>{% endif %}
-    <a href="/logout" class="nav-link">Sign out</a>
-  </div>
-</div>
-
-<div class="main">
-  <div class="page-title">Past Reviews</div>
-  <div class="page-sub">{{ festival_name }}</div>
+REVIEWS_BODY = """<div class="main">
+  <div class="page-sub" style="margin-bottom:22px">{{ festival_name }}</div>
 
   <!-- ── Filter bar ── -->
   <div class="filter-bar">
@@ -2624,92 +3297,11 @@ function clearFilters() {
 
 applyFilters();
 </script>
-</body></html>
 """
 
 
-MANAGE_HTML = """<!DOCTYPE html>
-<html><head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Manage — Festival Reviewer</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=DM+Sans:wght@300;400;500;600;700&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-:root{--bg:#0a0a0d;--bg2:#141419;--bg3:#1c1c24;--bg4:#24242e;--border:rgba(255,255,255,.08);
-      --border-gold:rgba(209,175,98,.22);--text:#eceae4;--dim:#a29e96;--muted:#78747f;
-      --gold:#d1af62;--gold2:#ecca86;--red:#e5695f;--green:#5cbf8a}
-body{background:var(--bg);color:var(--text);font-family:'DM Sans',sans-serif;min-height:100vh;
-     background-image:radial-gradient(ellipse 90% 40% at 50% -5%,rgba(209,175,98,.06),transparent 70%)}
-::selection{background:rgba(209,175,98,.28);color:#fff}
-.header{display:flex;align-items:center;justify-content:space-between;padding:14px 32px;
-        border-bottom:1px solid var(--border);background:rgba(16,16,21,.85);backdrop-filter:blur(12px);position:sticky;top:0;z-index:10}
-.logo{font-family:'Bebas Neue',sans-serif;font-size:22px;color:var(--gold);letter-spacing:2px}
-.nav-link{font-size:11px;color:var(--muted);text-decoration:none;font-family:'DM Mono',monospace;
-          letter-spacing:1px;transition:color .15s}
-.nav-link:hover,.nav-link.active{color:var(--gold)}
-.header-right{display:flex;align-items:center;gap:18px}
-.main{max-width:860px;margin:0 auto;padding:40px 24px}
-.page-title{font-family:'Bebas Neue',sans-serif;font-size:44px;color:var(--gold);letter-spacing:1px;margin-bottom:2px;line-height:1}
-.page-sub{color:var(--dim);font-size:13px;font-family:'DM Mono',monospace;margin-bottom:32px}
-.section{background:linear-gradient(180deg,var(--bg2),#101015);border:1px solid var(--border);border-radius:16px;padding:26px 28px;margin-bottom:22px;box-shadow:0 12px 40px -24px rgba(0,0,0,.8)}
-.section-header{display:flex;align-items:center;gap:12px;margin-bottom:20px;padding-bottom:16px;border-bottom:1px solid var(--border)}
-.section-icon{width:34px;height:34px;border-radius:9px;background:linear-gradient(145deg,rgba(209,175,98,.16),rgba(209,175,98,.03));
-              border:1px solid var(--border-gold);color:var(--gold);display:flex;align-items:center;justify-content:center;flex-shrink:0}
-.section-icon svg{width:17px;height:17px}
-.section-title{font-size:15px;font-weight:600;color:var(--text);letter-spacing:.2px}
-.section-festival{font-size:11px;color:var(--gold);font-family:'DM Mono',monospace;margin-left:auto;
-                  background:rgba(209,175,98,.08);border:1px solid var(--border-gold);border-radius:20px;padding:3px 10px}
-.chips{display:flex;flex-wrap:wrap;gap:8px;min-height:32px;margin-bottom:14px}
-.chip{display:inline-flex;align-items:center;gap:7px;background:var(--bg4);
-      border:1px solid var(--border-gold);border-radius:8px;padding:5px 12px;
-      font-size:12px;font-family:'DM Mono',monospace;color:var(--gold);transition:border-color .15s}
-.chip:hover{border-color:rgba(209,175,98,.4)}
-.chip-lbl{cursor:pointer}
-.chip-lbl:hover{color:var(--gold2);text-decoration:underline dotted}
-.chip-del{cursor:pointer;color:var(--muted);font-size:15px;line-height:1;transition:color .15s}
-.chip-del:hover{color:var(--red)}
-.empty-chips{font-size:12px;color:var(--muted);font-family:'DM Mono',monospace;padding:6px 0}
-.add-row{display:flex;gap:10px}
-.add-row input{flex:1;background:var(--bg3);border:1px solid var(--border);border-radius:9px;
-               color:var(--text);padding:11px 14px;font-size:13px;outline:none;transition:border-color .2s,box-shadow .2s;font-family:'DM Sans',sans-serif}
-.add-row input::placeholder{color:#54515c}
-.add-row input:focus{border-color:var(--gold);box-shadow:0 0 0 3px rgba(209,175,98,.12)}
-.add-btn{background:linear-gradient(180deg,var(--gold2),var(--gold));color:#1a1408;border:none;border-radius:9px;padding:11px 20px;
-         font-size:13px;font-weight:600;cursor:pointer;transition:transform .15s,box-shadow .2s;white-space:nowrap;box-shadow:0 5px 16px -6px rgba(209,175,98,.5)}
-.add-btn:hover{transform:translateY(-1px);box-shadow:0 9px 22px -8px rgba(209,175,98,.6)}
-.inline-edit{background:var(--bg3);border:1px solid rgba(209,175,98,.45);border-radius:5px;
-             color:var(--text);padding:3px 8px;font-size:12px;font-family:'DM Mono',monospace;width:140px;outline:none}
-.toast{position:fixed;bottom:24px;right:24px;background:var(--bg4);border:1px solid var(--border-gold);
-       border-radius:11px;padding:12px 20px;font-size:13px;color:var(--gold);font-family:'DM Mono',monospace;
-       opacity:0;transform:translateY(8px);transition:all .3s;z-index:999;pointer-events:none;box-shadow:0 16px 40px -18px rgba(0,0,0,.9)}
-.toast.show{opacity:1;transform:translateY(0)}
-.toast.err{color:var(--red);border-color:rgba(229,105,95,.35)}
-@media(max-width:640px){
-  .header{padding:10px 14px}
-  .main{padding:20px 14px}
-  .page-title{font-size:28px}
-  .section{padding:18px}
-  .add-row{flex-wrap:wrap}
-  .add-btn{width:100%}
-}
-</style>
-</head><body>
-<div class="header">
-  <div class="logo">Festival Reviewer</div>
-  <div class="header-right">
-    <a href="/" class="nav-link">Submit</a>
-    <a href="/reviews" class="nav-link">Reviews</a>
-    <a href="/manage" class="nav-link active">Manage</a>
-    {% if user_role == 'admin' %}<a href="/admin" class="nav-link" style="color:var(--gold)">Admin</a>{% endif %}
-    <a href="/logout" class="nav-link">Sign out</a>
-  </div>
-</div>
-
-<div class="main">
-  <div class="page-title">Manage</div>
-  <div class="page-sub">Categories and seasons per festival</div>
+MANAGE_BODY = """<div class="main">
+  <div class="page-sub" style="margin-bottom:22px">Categories and seasons per festival</div>
 
   {% if not festivals %}
   <div style="color:var(--muted);font-size:13px">No festivals assigned to your account.</div>
@@ -2943,93 +3535,10 @@ catsLoad('{{ fk }}');
 seasonsLoad('{{ fk }}');
 {% endfor %}
 </script>
-</body></html>
 """
 
 
-REVIEW_DETAIL_HTML = """<!DOCTYPE html>
-<html><head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{{ film.title }} — Review</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=DM+Sans:wght@300;400;500;600;700&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-:root{--bg:#0a0a0d;--bg2:#141419;--bg3:#1c1c24;--bg4:#24242e;--border:rgba(255,255,255,.08);
-      --border-gold:rgba(209,175,98,.22);--text:#eceae4;--dim:#a29e96;--muted:#78747f;
-      --gold:#d1af62;--gold2:#ecca86;--green:#5cbf8a}
-body{background:var(--bg);color:var(--text);font-family:'DM Sans',sans-serif;min-height:100vh;
-     background-image:radial-gradient(ellipse 90% 40% at 50% -5%,rgba(209,175,98,.06),transparent 70%)}
-::selection{background:rgba(209,175,98,.28);color:#fff}
-.header{display:flex;align-items:center;justify-content:space-between;padding:14px 32px;
-        border-bottom:1px solid var(--border);background:rgba(16,16,21,.85);backdrop-filter:blur(12px);position:sticky;top:0;z-index:20}
-.header-logo{font-family:'Bebas Neue',sans-serif;font-size:22px;letter-spacing:2px;color:var(--gold)}
-.header-right{display:flex;gap:18px;align-items:center}
-.nav-link{color:var(--muted);text-decoration:none;font-size:11px;font-family:'DM Mono',monospace;letter-spacing:1px;transition:color .15s}
-.nav-link:hover{color:var(--gold)}
-.main{max-width:820px;margin:0 auto;padding:40px 24px}
-.back{display:inline-flex;align-items:center;gap:6px;color:var(--muted);text-decoration:none;
-      font-size:12px;font-family:'DM Mono',monospace;margin-bottom:28px;transition:color .15s}
-.back:hover{color:var(--gold)}
-.film-header{margin-bottom:28px}
-.film-title{font-family:'Bebas Neue',sans-serif;font-size:40px;line-height:1;color:var(--text);letter-spacing:.5px;margin-bottom:8px}
-.film-director{font-size:14px;color:var(--dim);margin-bottom:16px}
-.film-meta{display:flex;gap:8px;flex-wrap:wrap}
-.meta-tag{font-size:11px;font-family:'DM Mono',monospace;background:var(--bg3);
-          border:1px solid var(--border);border-radius:6px;padding:4px 11px;color:var(--dim)}
-.review-block{background:linear-gradient(180deg,var(--bg2),#101015);border:1px solid var(--border);border-radius:16px;
-              padding:30px 32px;margin-top:22px;box-shadow:0 12px 40px -24px rgba(0,0,0,.8)}
-.review-block-header{display:flex;align-items:center;justify-content:space-between;
-                     margin-bottom:22px;padding-bottom:16px;border-bottom:1px solid var(--border)}
-.festival-badge{font-size:11px;font-family:'DM Mono',monospace;background:rgba(209,175,98,.09);
-                border:1px solid var(--border-gold);border-radius:6px;padding:4px 11px;color:var(--gold)}
-.review-date{font-size:11px;font-family:'DM Mono',monospace;color:var(--muted)}
-.review-text{font-size:14.5px;line-height:1.9;color:#dedbd3;white-space:pre-wrap}
-.scores-row{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:20px}
-.score-box{flex:1;min-width:90px;background:var(--bg3);border:1px solid var(--border);
-           border-radius:11px;padding:13px 14px;text-align:center}
-.score-box.overall{background:linear-gradient(160deg,rgba(209,175,98,.14),rgba(209,175,98,.03));border-color:var(--border-gold)}
-.score-box .lbl{display:block;font-size:9.5px;font-family:'DM Mono',monospace;color:var(--muted);
-                text-transform:uppercase;letter-spacing:1px;margin-bottom:8px}
-.score-box .num{font-family:'Bebas Neue',sans-serif;font-size:30px;line-height:1;color:var(--text)}
-.score-box.overall .num{color:var(--gold)}
-.score-box .den{font-size:11px;color:var(--muted);font-family:'DM Mono',monospace}
-.obs-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:8px}
-.obs-item{background:var(--bg3);border:1px solid var(--border);border-radius:11px;padding:15px 16px}
-.obs-item.standout{border-color:rgba(92,191,138,.32);border-left:3px solid var(--green)}
-.obs-item.weakest{border-color:rgba(229,150,95,.32);border-left:3px solid #e5965f}
-.obs-item .obs-lbl{display:block;font-size:10px;font-family:'DM Mono',monospace;
-                   text-transform:uppercase;letter-spacing:1px;color:var(--muted);margin-bottom:6px}
-.obs-item.standout .obs-lbl{color:var(--green)}
-.obs-item.weakest .obs-lbl{color:#e5965f}
-.obs-item .obs-body{font-size:13px;line-height:1.65;color:var(--text)}
-.section-divider{font-size:10px;font-family:'DM Mono',monospace;text-transform:uppercase;
-                 letter-spacing:2px;color:var(--gold-d,#a2854a);margin:24px 0 14px}
-.copy-btn{display:inline-flex;align-items:center;gap:6px;margin-top:20px;padding:9px 16px;
-          background:var(--bg3);border:1px solid var(--border);border-radius:9px;
-          color:var(--dim);font-size:12px;cursor:pointer;transition:all .15s;font-family:'DM Sans',sans-serif}
-.copy-btn:hover{border-color:var(--border-gold);color:var(--gold)}
-.empty{color:var(--muted);font-size:13px;font-family:'DM Mono',monospace;padding:40px 0}
-@media(max-width:640px){
-  .main{padding:20px 12px}
-  .header{padding:12px 16px}
-  .review-block{padding:20px 16px}
-  .film-title{font-size:20px}
-  .film-meta{flex-wrap:wrap}
-}
-</style>
-</head><body>
-<div class="header">
-  <div class="header-logo">Festival Reviewer</div>
-  <div class="header-right">
-    <a href="/reviews" class="nav-link">← All Reviews</a>
-    <a href="/manage" class="nav-link">Manage</a>
-    {% if user_role == 'admin' %}<a href="/admin" class="nav-link">Admin</a>{% endif %}
-    <a href="/logout" class="nav-link">Sign out</a>
-  </div>
-</div>
-<div class="main">
+REVIEW_DETAIL_BODY = """<div class="main">
   <a href="/reviews" class="back">← Back to reviews</a>
 
   <div class="film-header">
@@ -3092,12 +3601,21 @@ body{background:var(--bg);color:var(--text);font-family:'DM Sans',sans-serif;min
       <div class="section-divider" style="margin-top:0">Expert Review</div>
       <div class="review-text" id="reviewText{{ loop.index }}">{{ r.review_text }}</div>
       <button class="copy-btn" onclick="copyReview({{ loop.index }})">Copy review</button>
+      <div class="publish-bar">
+        <span class="pb-label">Publish to WordPress</span>
+        <span class="wp-status" id="wpstat-{{ loop.index }}" {% if not r.wp_url %}style="display:none"{% endif %}>
+          ● Published — <a href="{{ r.wp_url }}" target="_blank" rel="noopener">view post</a>
+        </span>
+        <button class="btn btn-ghost btn-sm" onclick="wpPublish('{{ film.film_id }}','draft',{{ loop.index }},this)">Save as Draft</button>
+        <button class="btn btn-gold btn-sm" onclick="wpPublish('{{ film.film_id }}','publish',{{ loop.index }},this)">Publish live</button>
+      </div>
     </div>
     {% endfor %}
   {% else %}
   <div class="empty">No review found for this film.</div>
   {% endif %}
 </div>
+<div class="toast" id="toast"></div>
 <script>
 function copyReview(idx) {
   const text = document.getElementById('reviewText' + idx).textContent;
@@ -3107,218 +3625,25 @@ function copyReview(idx) {
     setTimeout(() => btn.textContent = 'Copy review', 2000);
   });
 }
+function _toast(msg, err){const t=document.getElementById('toast');t.textContent=msg;t.className='toast show'+(err?' err':'');clearTimeout(t._t);t._t=setTimeout(()=>t.className='toast',3200);}
+function wpPublish(filmId, status, idx, btn){
+  const old = btn.textContent; btn.textContent = 'Publishing…'; btn.disabled = true;
+  fetch('/api/reviews/'+filmId+'/publish',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({status:status})})
+    .then(r=>r.json().then(d=>({ok:r.ok,d})))
+    .then(({ok,d})=>{
+      btn.textContent = old; btn.disabled = false;
+      if(!ok){ _toast(d.error||'Publish failed', true); return; }
+      _toast(status==='publish'?'Published live to WordPress':'Saved as draft in WordPress');
+      const st = document.getElementById('wpstat-'+idx);
+      if(st && d.url){ st.style.display=''; st.querySelector('a').href=d.url; }
+    });
+}
 </script>
-</body></html>
 """
 
 
-APP_HTML = """<!DOCTYPE html>
-<html><head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{{ festival }} — Festival Reviewer</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=DM+Sans:ital,wght@0,300;0,400;0,500;0,600;0,700;1,300&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
-<style>
-:root{--gold:#d1af62;--gold-l:#ecca86;--gold-d:#a2854a;
-     --bg:#0a0a0d;--bg2:#141419;--bg3:#1c1c24;--bg4:#24242e;
-     --border:rgba(255,255,255,.08);--border-gold:rgba(209,175,98,.22);
-     --text:#eceae4;--dim:#a29e96;--muted:#78747f;
-     --green:#5cbf8a;--red:#e5695f;--blue:#6f9de8}
-*{margin:0;padding:0;box-sizing:border-box}
-body{background:var(--bg);color:var(--text);font-family:'DM Sans',sans-serif;min-height:100vh;
-     background-image:radial-gradient(ellipse 90% 40% at 50% -5%,rgba(209,175,98,.07),transparent 70%)}
-::selection{background:rgba(209,175,98,.28);color:#fff}
-
-.header{background:rgba(16,16,21,.85);backdrop-filter:blur(12px);border-bottom:1px solid var(--border);
-        padding:14px 28px;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:20}
-.header-logo{font-family:'Bebas Neue',sans-serif;font-size:22px;color:var(--gold);letter-spacing:2px}
-.header-right{display:flex;align-items:center;gap:18px}
-.user-badge{font-size:11px;color:var(--muted);font-family:'DM Mono',monospace}
-.logout{font-size:11px;color:var(--muted);text-decoration:none;font-family:'DM Mono',monospace;letter-spacing:1px;transition:color .2s}
-.logout:hover{color:var(--gold)}
-
-.main{max-width:960px;margin:0 auto;padding:40px 20px}
-.page-title{font-family:'Bebas Neue',sans-serif;font-size:46px;color:var(--gold);letter-spacing:1px;margin-bottom:2px;line-height:1}
-.page-sub{font-size:13px;color:var(--dim);margin-bottom:30px}
-
-.card{background:linear-gradient(180deg,var(--bg2),#101015);border:1px solid var(--border);border-radius:16px;overflow:hidden;margin-bottom:20px;box-shadow:0 12px 40px -24px rgba(0,0,0,.8)}
-.card-head{padding:18px 24px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:12px;background:rgba(255,255,255,.015)}
-.card-head-icon{width:32px;height:32px;border-radius:9px;background:linear-gradient(145deg,rgba(209,175,98,.16),rgba(209,175,98,.03));
-                border:1px solid var(--border-gold);color:var(--gold);
-                display:flex;align-items:center;justify-content:center;flex-shrink:0}
-.card-head-icon svg{width:16px;height:16px}
-.card-head-title{font-size:11px;letter-spacing:2px;color:var(--dim);text-transform:uppercase;
-                 font-family:'DM Mono',monospace;font-weight:500}
-.card-body{padding:22px 24px}
-
-/* ── Film library picker ── */
-.library-picker{background:var(--bg3);border:1px solid var(--border-gold);
-                border-radius:12px;padding:16px 18px;margin-bottom:20px}
-.library-label{font-size:10px;color:var(--gold-d);letter-spacing:2px;text-transform:uppercase;
-               font-family:'DM Mono',monospace;margin-bottom:8px}
-.library-select{width:100%;background:var(--bg2);border:1px solid var(--border);
-                border-radius:9px;padding:11px 13px;color:var(--text);font-family:'DM Sans',sans-serif;
-                font-size:13px;outline:none;transition:border-color .2s,box-shadow .2s}
-.library-select:focus{border-color:var(--gold);box-shadow:0 0 0 3px rgba(209,175,98,.12)}
-.library-hint{font-size:11px;color:var(--muted);font-family:'DM Mono',monospace;margin-top:6px;min-height:16px}
-.cache-badge{display:inline-flex;align-items:center;gap:5px;background:rgba(92,191,138,.1);
-             border:1px solid rgba(92,191,138,.28);border-radius:6px;padding:3px 10px;
-             font-size:11px;color:var(--green);font-family:'DM Mono',monospace;margin-top:6px}
-
-/* ── Form ── */
-.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
-.form-group{display:flex;flex-direction:column;gap:7px}
-.form-group.full{grid-column:1/-1}
-label{font-size:10px;color:var(--muted);letter-spacing:1.5px;text-transform:uppercase;font-family:'DM Mono',monospace}
-.optional-tag{font-size:9px;color:var(--muted);opacity:.6;font-family:'DM Mono',monospace;margin-left:4px}
-input[type=text],input[type=number],select,textarea{
-  background:var(--bg3);border:1px solid var(--border);border-radius:9px;
-  padding:11px 13px;color:var(--text);font-family:'DM Sans',sans-serif;font-size:13px;
-  outline:none;width:100%;transition:border-color .2s,box-shadow .2s;resize:vertical}
-input::placeholder,textarea::placeholder{color:#54515c}
-input[type=text]:focus,input[type=number]:focus,select:focus,textarea:focus{border-color:var(--gold);box-shadow:0 0 0 3px rgba(209,175,98,.12)}
-select option{background:var(--bg3)}
-textarea{min-height:82px;line-height:1.55}
-.festival-hint{font-size:11px;color:var(--muted);margin-top:4px;font-family:'DM Mono',monospace;min-height:16px}
-
-/* ── Source toggle ── */
-.link-input-wrap{display:flex;flex-direction:column;gap:8px}
-.link-input-wrap input{background:var(--bg3);border:1px solid var(--border);border-radius:9px;
-  padding:12px 14px;color:var(--text);font-family:'DM Sans',sans-serif;font-size:13px;outline:none;
-  width:100%;transition:border-color .2s,box-shadow .2s}
-.link-input-wrap input:focus{border-color:var(--gold);box-shadow:0 0 0 3px rgba(209,175,98,.12)}
-.link-hint{font-size:11px;color:var(--muted);font-family:'DM Mono',monospace}
-
-/* ── Drop zone ── */
-.drop-zone{border:1.5px dashed var(--border-gold);border-radius:14px;padding:44px 24px;
-           text-align:center;cursor:pointer;transition:all .2s;position:relative;background:rgba(255,255,255,.015)}
-.drop-zone:hover{border-color:rgba(209,175,98,.4);background:rgba(209,175,98,.03)}
-.drop-zone.drag-over{border-color:var(--gold);background:rgba(209,175,98,.06)}
-.drop-zone.has-file{border-color:rgba(92,191,138,.45);background:rgba(92,191,138,.05)}
-.drop-icon{font-size:38px;margin-bottom:12px;opacity:.65}
-.drop-title{font-size:15px;font-weight:600;color:var(--text);margin-bottom:4px}
-.drop-sub{font-size:12px;color:var(--muted)}
-.file-info{font-size:12px;color:var(--green);font-family:'DM Mono',monospace;margin-top:8px;font-weight:500}
-input[type=file]{display:none}
-
-.submit-btn{width:100%;background:linear-gradient(180deg,var(--gold-l),var(--gold));color:#1a1408;border:none;border-radius:11px;
-            padding:15px;font-family:'DM Sans',sans-serif;font-weight:700;font-size:15px;
-            cursor:pointer;margin-top:4px;transition:transform .15s,box-shadow .2s;letter-spacing:.3px;
-            box-shadow:0 8px 22px -8px rgba(209,175,98,.55)}
-.submit-btn:hover:not(:disabled){transform:translateY(-1px);box-shadow:0 12px 28px -10px rgba(209,175,98,.65)}
-.submit-btn:disabled{opacity:.35;cursor:not-allowed;transform:none;box-shadow:none}
-.rewrite-btn{width:100%;background:linear-gradient(180deg,#6bd39c,var(--green));color:#08230f;border:none;border-radius:11px;
-             padding:15px;font-family:'DM Sans',sans-serif;font-weight:700;font-size:15px;
-             cursor:pointer;margin-top:4px;transition:transform .15s,box-shadow .2s;letter-spacing:.3px;
-             box-shadow:0 8px 22px -8px rgba(92,191,138,.5)}
-.rewrite-btn:hover{transform:translateY(-1px);box-shadow:0 12px 28px -10px rgba(92,191,138,.6)}
-
-/* ── Progress ── */
-.progress-card{display:none}.progress-card.active{display:block}
-.progress-status{display:flex;align-items:center;gap:12px;margin-bottom:16px}
-.spinner{width:20px;height:20px;border:2px solid rgba(201,168,76,.2);border-top-color:var(--gold);
-         border-radius:50%;animation:spin .8s linear infinite;flex-shrink:0}
-@keyframes spin{to{transform:rotate(360deg)}}
-.progress-msg{font-size:13px;color:var(--text)}
-.progress-pct{font-family:'DM Mono',monospace;font-size:12px;color:var(--gold);margin-left:auto}
-.progress-track{height:4px;background:rgba(255,255,255,.06);border-radius:2px;overflow:hidden}
-.progress-fill{height:100%;background:linear-gradient(90deg,var(--gold-d),var(--gold),var(--gold-l));
-               border-radius:2px;transition:width .4s ease;box-shadow:0 0 8px rgba(201,168,76,.4)}
-.step-list{display:flex;flex-direction:column;gap:8px;margin-top:16px}
-.step{display:flex;align-items:center;gap:10px;font-size:12px;color:var(--muted);font-family:'DM Mono',monospace}
-.step.active{color:var(--text)}.step.done{color:var(--green)}
-.step-dot{width:6px;height:6px;border-radius:50%;background:currentColor;flex-shrink:0}
-
-/* ── Results ── */
-.results-card{display:none}.results-card.active{display:block}
-.scores-row{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:20px}
-.score-box{background:var(--bg3);border:1px solid var(--border);border-radius:11px;padding:14px;text-align:center}
-.score-label{font-size:9px;color:var(--muted);letter-spacing:1.5px;text-transform:uppercase;
-             font-family:'DM Mono',monospace;display:block;margin-bottom:6px}
-.score-num{font-family:'Bebas Neue',sans-serif;font-size:34px;color:var(--gold);line-height:1}
-.score-denom{font-size:11px;color:var(--muted);font-family:'DM Mono',monospace}
-.overall{background:linear-gradient(160deg,rgba(209,175,98,.14),rgba(209,175,98,.03));border:1px solid var(--border-gold)}
-.obs-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:20px}
-.obs-item{background:var(--bg3);border:1px solid var(--border);border-radius:11px;padding:14px 16px}
-.obs-label{font-size:9px;color:var(--muted);letter-spacing:1.5px;text-transform:uppercase;
-           font-family:'DM Mono',monospace;display:block;margin-bottom:5px}
-.obs-text{font-size:12.5px;color:var(--text);line-height:1.6}
-.standout{border-left:3px solid var(--gold);padding-left:12px}
-.weakest{border-left:3px solid rgba(229,105,95,.6);padding-left:12px}
-.review-block{background:var(--bg3);border:1px solid var(--border);border-radius:12px;padding:20px;position:relative}
-.review-text{font-size:14.5px;line-height:1.9;color:#dedbd3;white-space:pre-wrap;font-family:'DM Sans',sans-serif}
-.copy-btn{position:absolute;top:12px;right:12px;background:rgba(209,175,98,.1);border:1px solid var(--border-gold);
-          border-radius:8px;padding:6px 13px;color:var(--gold);font-size:11px;font-family:'DM Mono',monospace;
-          cursor:pointer;transition:all .2s}
-.copy-btn:hover{background:rgba(209,175,98,.2)}.copy-btn.copied{color:var(--green);border-color:rgba(92,191,138,.35)}
-.new-btn{width:100%;background:transparent;border:1px solid var(--border);border-radius:11px;padding:13px;
-         color:var(--dim);font-family:'DM Sans',sans-serif;font-size:14px;cursor:pointer;margin-top:12px;transition:all .2s}
-.new-btn:hover{border-color:var(--border-gold);color:var(--text)}
-.error-msg{background:rgba(229,105,95,.07);border:1px solid rgba(229,105,95,.25);border-radius:9px;
-           padding:12px 16px;font-size:13px;color:#f0a09a;display:none}
-.error-msg.active{display:block}
-.film-tag{display:inline-flex;align-items:center;gap:6px;background:rgba(209,175,98,.07);
-          border:1px solid var(--border-gold);border-radius:20px;padding:5px 13px;font-size:11px;
-          color:var(--gold-l);font-family:'DM Mono',monospace;margin-bottom:16px}
-
-@media(max-width:640px){
-  /* Layout */
-  .main{padding:16px 12px}
-  .header{padding:10px 14px}
-  .header-right{gap:8px}
-  .user-badge{display:none}
-  .page-title{font-size:28px}
-  .page-sub{font-size:12px;margin-bottom:20px}
-
-  /* Cards */
-  .card{border-radius:10px;margin-bottom:14px}
-  .card-head{padding:14px 16px}
-  .card-body{padding:14px 16px}
-
-  /* Forms */
-  .form-grid{grid-template-columns:1fr}
-  .form-group.full{grid-column:1}
-  /* Drop zone */
-  .drop-zone{padding:28px 16px}
-  .drop-icon{font-size:28px;margin-bottom:8px}
-
-  /* Scores */
-  .scores-row{grid-template-columns:1fr 1fr;gap:8px}
-  .score-num{font-size:26px}
-  .score-box{padding:10px}
-
-  /* Observations */
-  .obs-grid{grid-template-columns:1fr}
-
-  /* Review block */
-  .review-block{padding:14px;padding-top:44px}
-  .copy-btn{top:10px;right:10px;font-size:10px;padding:5px 10px}
-  .review-text{font-size:13px;line-height:1.7}
-
-  /* Film tag */
-  .film-tag{font-size:10px;padding:3px 10px;flex-wrap:wrap}
-
-  /* Progress */
-  .progress-status{gap:8px}
-  .progress-pct{display:none}
-}
-</style></head><body>
-
-<div class="header">
-  <div class="header-logo">{{ festivals[user_festival].name if user_festival in festivals else 'Festival Reviewer' }}</div>
-  <div class="header-right">
-    <span class="user-badge">{{ user }}</span>
-    <a href="/reviews" class="logout">Past Reviews</a>
-    <a href="/manage" class="logout">Manage</a>
-    {% if session.get('role') == 'admin' %}<a href="/admin" class="logout" style="color:var(--gold)">Admin</a>{% endif %}
-    <a href="/logout" class="logout">Sign out</a>
-  </div>
-</div>
-
-<div class="main">
-  <div class="page-title">Expert Review</div>
-  <div class="page-sub">Upload a film and generate an AI-assisted Expert Review for the selected festival</div>
+APP_BODY = """<div class="main">
+  <div class="page-sub" style="margin-bottom:22px">Upload a film and generate an AI-assisted Expert Review for the selected festival</div>
 
   <!-- ── FORM ── -->
   <div id="formSection">
@@ -3471,6 +3796,12 @@ input[type=file]{display:none}
         <div class="review-block">
           <button class="copy-btn" id="copyBtn" onclick="copyReview()">Copy</button>
           <div class="review-text" id="reviewText"></div>
+        </div>
+        <div class="publish-bar" id="publishBar" style="display:none">
+          <span class="pb-label">Publish to WordPress</span>
+          <span class="wp-status" id="wpResultStatus" style="display:none">● Published — <a href="#" target="_blank" rel="noopener">view post</a></span>
+          <button class="btn btn-ghost btn-sm" id="pubDraftBtn" onclick="publishResult('draft')">Save as Draft</button>
+          <button class="btn btn-gold btn-sm" id="pubLiveBtn" onclick="publishResult('publish')">Publish live</button>
         </div>
         <button class="new-btn" onclick="resetForm()">← Generate another review</button>
       </div>
@@ -3957,6 +4288,15 @@ function showResults(job) {
 
   // Review text — already uses textContent
   document.getElementById('reviewText').textContent = job.review || '';
+
+  // Publish-to-WordPress actions
+  window._resultFilmId = job.film_id || '';
+  const pubBar = document.getElementById('publishBar');
+  if (pubBar) {
+    pubBar.style.display = window._resultFilmId ? 'flex' : 'none';
+    const st = document.getElementById('wpResultStatus');
+    if (st) st.style.display = 'none';
+  }
 }
 
 // ── Copy ───────────────────────────────────────────────────
@@ -3966,6 +4306,25 @@ function copyReview() {
     btn.textContent = '✓ Copied'; btn.classList.add('copied');
     setTimeout(() => { btn.textContent = 'Copy'; btn.classList.remove('copied'); }, 2000);
   });
+}
+
+// ── Publish generated review to WordPress ──────────────────
+function publishResult(status) {
+  const filmId = window._resultFilmId;
+  if (!filmId) return;
+  const btn = document.getElementById(status === 'publish' ? 'pubLiveBtn' : 'pubDraftBtn');
+  const old = btn.textContent; btn.textContent = 'Publishing…'; btn.disabled = true;
+  fetch('/api/reviews/' + filmId + '/publish', {
+    method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({status: status})
+  }).then(r => r.json().then(d => ({ok: r.ok, d})))
+    .then(({ok, d}) => {
+      btn.textContent = old; btn.disabled = false;
+      const err = document.getElementById('errorMsg');
+      if (!ok) { err.textContent = d.error || 'Publish failed'; err.classList.add('active'); return; }
+      err.classList.remove('active');
+      const st = document.getElementById('wpResultStatus');
+      if (st && d.url) { st.style.display = ''; st.querySelector('a').href = d.url; }
+    });
 }
 
 // ── Helpers ────────────────────────────────────────────────
@@ -4004,7 +4363,7 @@ function resetForm() {
   setSource('link');
 }
 </script>
-</body></html>"""
+"""
 
 
 if __name__ == "__main__":
