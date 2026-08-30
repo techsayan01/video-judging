@@ -999,8 +999,6 @@ def upload():
         return jsonify({"error": "Title and director are required"}), 400
     if not genre:
         return jsonify({"error": "Genre / Category is required"}), 400
-    if not season:
-        return jsonify({"error": "Season is required"}), 400
 
     gcs_blob = _sanitise(request.form.get("gcs_blob", ""), 256)
     has_file = "video" in request.files and request.files["video"].filename
@@ -2461,8 +2459,8 @@ DASHBOARD_BODY = """
           <td style="color:var(--dim);font-family:'DM Mono',monospace;font-size:11px">{{ r.festival_name }}</td>
           <td>{% if r.season %}<span class="badge badge-muted">{{ r.season }}</span>{% endif %}</td>
           <td style="text-align:right">
-            {% if r.overall_rating not in (None, '') %}
-            <span class="rc-score">{{ '%.1f'|format(r.overall_rating|float) }}<span class="d">/10</span></span>
+            {% if r.get('overall_rating') not in (None, '') %}
+            <span class="rc-score">{{ '%.1f'|format(r.get('overall_rating')|float) }}<span class="d">/10</span></span>
             {% endif %}
           </td>
           <td style="text-align:right;padding-right:22px">
@@ -3209,15 +3207,15 @@ REVIEWS_BODY = """<div class="main">
        data-country="{{ (r.country or '')|lower }}"
        data-season="{{ r.season or '' }}"
        data-category="{{ r.genre or '' }}"
-       data-rating="{{ r.overall_rating if r.overall_rating is not none and r.overall_rating != '' else '' }}">
+       data-rating="{{ r.get('overall_rating') if r.get('overall_rating') is not none and r.get('overall_rating') != '' else '' }}">
       <div class="rc-top">
         <div>
           <div class="rc-title">{{ r.title }}</div>
           <div class="rc-director">{{ r.director }}</div>
         </div>
         <div style="display:flex;flex-direction:column;align-items:flex-end;gap:4px">
-          {% if r.overall_rating is not none and r.overall_rating != '' %}
-          <div style="font-family:'DM Mono',monospace;font-size:18px;font-weight:600;color:var(--gold);line-height:1">{{ '%.1f'|format(r.overall_rating|float) }}<span style="font-size:11px;color:var(--muted)">/10</span></div>
+          {% if r.get('overall_rating') is not none and r.get('overall_rating') != '' %}
+          <div style="font-family:'DM Mono',monospace;font-size:18px;font-weight:600;color:var(--gold);line-height:1">{{ '%.1f'|format(r.get('overall_rating')|float) }}<span style="font-size:11px;color:var(--muted)">/10</span></div>
           {% endif %}
           <div class="rc-date">{{ r.created_at[:10] if r.created_at else '' }}</div>
         </div>
@@ -3567,7 +3565,7 @@ REVIEW_DETAIL_BODY = """<div class="main">
       <div class="score-box"><span class="lbl">Pacing</span><span class="num">{{ r.pacing if r.pacing is not none else '—' }}</span><span class="den">/10</span></div>
       <div class="score-box"><span class="lbl">Structure</span><span class="num">{{ r.structure if r.structure is not none else '—' }}</span><span class="den">/10</span></div>
       <div class="score-box"><span class="lbl">Sound / Music</span><span class="num">{{ r.sound_music if r.sound_music is not none else '—' }}</span><span class="den">/10</span></div>
-      <div class="score-box overall"><span class="lbl">Overall</span><span class="num">{{ '%.1f'|format(a.overall_rating|float) if a.overall_rating is not none else '—' }}</span><span class="den">/10</span></div>
+      <div class="score-box overall"><span class="lbl">Overall</span><span class="num">{{ '%.1f'|format(a.get('overall_rating')|float) if a.get('overall_rating') is not none else '—' }}</span><span class="den">/10</span></div>
     </div>
     {% else %}
     <div class="scores-row">
@@ -3592,8 +3590,8 @@ REVIEW_DETAIL_BODY = """<div class="main">
       <div class="review-block-header">
         <span class="festival-badge">{{ r.festival_name }}</span>
         <div style="display:flex;align-items:center;gap:16px">
-          {% if r.overall_rating is not none and r.overall_rating != '' %}
-          <span style="font-family:'DM Mono',monospace;font-size:22px;font-weight:600;color:var(--gold)">{{ '%.1f'|format(r.overall_rating|float) }}<span style="font-size:12px;color:var(--muted)">/10</span></span>
+          {% if r.get('overall_rating') is not none and r.get('overall_rating') != '' %}
+          <span style="font-family:'DM Mono',monospace;font-size:22px;font-weight:600;color:var(--gold)">{{ '%.1f'|format(r.get('overall_rating')|float) }}<span style="font-size:12px;color:var(--muted)">/10</span></span>
           {% endif %}
           <span class="review-date">{{ r.created_at[:10] if r.created_at else '' }}</span>
         </div>
@@ -3701,9 +3699,9 @@ APP_BODY = """<div class="main">
             </select>
           </div>
           <div class="form-group">
-            <label>Season *</label>
-            <select id="season" required>
-              <option value="" disabled selected>— select a season —</option>
+            <label>Season <span class="optional-tag">optional</span></label>
+            <select id="season">
+              <option value="" selected>— select a season —</option>
             </select>
           </div>
           <div class="form-group full">
