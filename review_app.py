@@ -115,6 +115,15 @@ def _is_script_category(category: str) -> bool:
 MAX_FIELD_LEN  = 500
 MAX_TEXTAREA_LEN = 5000
 
+# Every genai.Client call (file upload, poll, generate_content) previously had no
+# timeout — a stalled network call (Gemini API hiccup, transient connectivity issue)
+# would block its thread forever holding a _processing_sem permit, with no exception
+# and no log line. Once enough threads on an instance got stuck this way, new jobs
+# would silently hang at progress=0 until the stale-job watchdog killed them 20
+# minutes later. A bounded timeout turns that silent hang into a catchable, logged
+# error within a few minutes instead.
+_GEMINI_HTTP_OPTIONS = types.HttpOptions(timeout=600_000)  # 10 min, generous for multi-GB uploads
+
 # Safety settings for film analysis — Gemini's defaults (BLOCK_MEDIUM_AND_ABOVE)
 # are too aggressive for legitimate cinema: horror, body-horror, thriller, drama,
 # and experimental films trigger BlockedReason.OTHER even at BLOCK_ONLY_HIGH.
@@ -520,7 +529,12 @@ def process_video(job_id: str, video_path: str, meta: dict):
     Tier 2 — > 120 min, GCS_BUCKET set:  stream to GCS → Gemini reads gs:// URI (no size limit).
     Tier 3 — > 120 min, no GCS:  extract keyframes in batches → multi-call analysis → merge.
     """
-    _processing_sem.acquire()  # blocks if 5 jobs already running; released in finally
+    if not _processing_sem.acquire(timeout=0):
+        # All 5 slots on this instance are busy — say so explicitly instead of
+        # leaving the job silently at progress=0, indistinguishable from a hang.
+        db.job_update(job_id, {"status": "queued", "progress": 2,
+                                "message": "Waiting for a processing slot (server is busy)…"})
+        _processing_sem.acquire()  # now block for real
     from downloader import get_video_duration, stream_to_gcs, delete_from_gcs, extract_keyframes
     from config import DIRECT_UPLOAD_MAX_MIN, CHUNK_FRAMES
 
@@ -529,7 +543,7 @@ def process_video(job_id: str, video_path: str, meta: dict):
     # Use MongoDB-backed config so festivals created via admin panel (not in seed) work correctly
     fk       = meta.get("festival_key", DEFAULT_FESTIVAL)
     festival = get_festivals().get(fk) or get_festival(fk)
-    client   = genai.Client(api_key=festival["gemini_api_key"])
+    client   = genai.Client(api_key=festival["gemini_api_key"], http_options=_GEMINI_HTTP_OPTIONS)
     model_id = festival.get("gemini_model", "gemini-2.5-flash")
 
     uploaded_files: list = []   # Gemini Files API handles to clean up
@@ -703,7 +717,7 @@ def process_rewrite(job_id: str, film: dict, meta: dict):
     """
     fk       = meta.get("festival_key", DEFAULT_FESTIVAL)
     festival = get_festivals().get(fk) or get_festival(fk)
-    client   = genai.Client(api_key=festival["gemini_api_key"])
+    client   = genai.Client(api_key=festival["gemini_api_key"], http_options=_GEMINI_HTTP_OPTIONS)
 
     try:
         db.job_update(job_id, {"status": "writing", "progress": 60,
@@ -744,10 +758,13 @@ def _read_document_text(path: str, ext: str) -> str:
 def process_document(job_id: str, doc_path: str, ext: str, meta: dict):
     """Analyse a written script/document with Gemini and write a review.
     PDFs go to the Gemini Files API directly; txt/docx are extracted to text."""
-    _processing_sem.acquire()
+    if not _processing_sem.acquire(timeout=0):
+        db.job_update(job_id, {"status": "queued", "progress": 2,
+                                "message": "Waiting for a processing slot (server is busy)…"})
+        _processing_sem.acquire()  # now block for real
     fk       = meta.get("festival_key", DEFAULT_FESTIVAL)
     festival = get_festivals().get(fk) or get_festival(fk)
-    client   = genai.Client(api_key=festival["gemini_api_key"])
+    client   = genai.Client(api_key=festival["gemini_api_key"], http_options=_GEMINI_HTTP_OPTIONS)
     model_id = festival.get("gemini_model", "gemini-2.5-flash")
     uploaded_files: list = []
     try:
@@ -1849,7 +1866,7 @@ def api_wp_template_generate(key):
     if not api_key:
         return jsonify({"error": "No Gemini API key configured for this festival."}), 400
     try:
-        client = genai.Client(api_key=api_key)
+        client = genai.Client(api_key=api_key, http_options=_GEMINI_HTTP_OPTIONS)
         model  = festival.get("gemini_model", "gemini-2.5-flash")
         template = wordpress.generate_template_from_reference(client, model, ref_html[:60000])
     except Exception as e:
