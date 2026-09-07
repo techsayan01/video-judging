@@ -449,6 +449,37 @@ def _gemini_generate_with_retry(client, model_id: str, contents, config,
     return resp  # final attempt result, callers handle the empty case
 
 
+def _analyse_video_with_resolution_fallback(client, model_id: str, contents, base_config: dict, job_id: str):
+    """Run the video analysis call at default resolution first (best detail).
+    If the film is long enough to blow Gemini's 1,048,576-token context window
+    (default video tokenisation is ~263 tok/s — anything past ~65 min can overflow,
+    well under our 120-min direct-upload ceiling), retry once at LOW resolution
+    (~66 tok/s, ~4+ hrs fits in-budget) and flag the result so the reduced-detail
+    pass is visible to the user rather than silently swapped in.
+    Returns (response, used_low_resolution: bool).
+    """
+    from google.genai import errors as genai_errors
+    try:
+        resp = _gemini_generate_with_retry(
+            client, model_id, contents, types.GenerateContentConfig(**base_config),
+        )
+        return resp, False
+    except genai_errors.ClientError as e:
+        msg = str(e).lower()
+        if "exceeds the maximum number of tokens" not in msg and "input token count exceeds" not in msg:
+            raise
+        logging.warning("[analysis] job %s exceeded token budget at default resolution — "
+                         "retrying at low resolution", job_id)
+        db.job_update(job_id, {"status": "analysing", "progress": 65,
+                                "message": "Film is long — retrying at reduced detail to fit Gemini's context window…"})
+        low_config = dict(base_config)
+        low_config["media_resolution"] = types.MediaResolution.MEDIA_RESOLUTION_LOW
+        resp = _gemini_generate_with_retry(
+            client, model_id, contents, types.GenerateContentConfig(**low_config),
+        )
+        return resp, True
+
+
 def _response_text(resp) -> str:
     """Return the model's text, or raise a clear error explaining why it's empty.
     Gemini returns no text when a request is blocked (safety/recitation), hits the
@@ -656,24 +687,25 @@ def process_video(job_id: str, video_path: str, meta: dict):
         # ── 3. Score & analyse ────────────────────────────────────────────
         db.job_update(job_id, {"status": "analysing", "progress": 65,
                                 "message": "Scoring story, direction & craft…"})
-        analysis_resp = _gemini_generate_with_retry(
+        analysis_resp, used_low_res = _analyse_video_with_resolution_fallback(
             client, model_id, analysis_contents,
-            types.GenerateContentConfig(
-                temperature=0.3,
-                max_output_tokens=8192,
+            {
+                "temperature": 0.3,
+                "max_output_tokens": 8192,
                 # NOTE: response_mime_type="application/json" conflicts with
                 # thinking_budget and produces malformed JSON — omitted intentionally.
-                thinking_config=types.ThinkingConfig(thinking_budget=0),
-                safety_settings=_FILM_SAFETY,
-                # Default video resolution tokenises at ~263 tok/s, which blows
-                # Gemini's 1,048,576-token context on anything past ~65 min —
-                # well under our 120-min direct-upload ceiling. LOW drops that
-                # to ~66 tok/s (~4+ hrs fits in-budget) at a modest detail cost,
-                # which is an acceptable trade-off for a token-limit hard failure.
-                media_resolution=types.MediaResolution.MEDIA_RESOLUTION_LOW,
-            ),
+                "thinking_config": types.ThinkingConfig(thinking_budget=0),
+                "safety_settings": _FILM_SAFETY,
+            },
+            job_id,
         )
         analysis = _parse_json(_response_text(analysis_resp))
+        if used_low_res:
+            analysis["quality_warning"] = (
+                "This film exceeded Gemini's analysis context window at full detail, so it was "
+                "re-analysed at reduced video resolution. Scores and notes are still based on a "
+                "full viewing, but fine visual/audio detail may be less precise than usual."
+            )
 
         # ── 4. Persist analysis ────────────────────────────────────────────
         db.job_update(job_id, {"status": "scoring", "progress": 75,
@@ -3577,6 +3609,12 @@ REVIEW_DETAIL_BODY = """<div class="main">
   </div>
 
   {% set a = film.analysis %}
+  {% if a and a.get('quality_warning') %}
+  <div style="background:rgba(230,180,60,.12);border:1px solid rgba(230,180,60,.35);border-radius:8px;
+              padding:12px 16px;margin:16px 0;color:var(--gold);font-size:13px;line-height:1.5">
+    ⚠ {{ a.get('quality_warning') }}
+  </div>
+  {% endif %}
   {% if a %}
   <div class="review-block">
     <div class="section-divider" style="margin-top:0">Detailed Assessment</div>
@@ -3808,6 +3846,8 @@ APP_BODY = """<div class="main">
       </div>
       <div class="card-body">
         <div id="filmTag" class="film-tag"></div>
+        <div id="qualityWarning" hidden style="background:rgba(230,180,60,.12);border:1px solid rgba(230,180,60,.35);
+             border-radius:8px;padding:12px 16px;margin-bottom:14px;color:var(--gold);font-size:13px;line-height:1.5"></div>
         <div class="scores-row" id="scoresRow"></div>
         <div class="obs-grid" id="obsGrid"></div>
       </div>
@@ -4278,6 +4318,14 @@ function showResults(job) {
   if (meta.runtime)      { filmTag.append(sep(), _span(meta.runtime)); }
   if (meta.festival_name){ filmTag.append(sep(), _span(meta.festival_name, 'color:var(--gold)')); }
   if (job.from_cache)    { filmTag.append(sep(), _span('⚡ cached', 'color:var(--green);font-size:10px')); }
+
+  const qualityWarning = document.getElementById('qualityWarning');
+  if (a.quality_warning) {
+    qualityWarning.textContent = '⚠ ' + a.quality_warning;
+    qualityWarning.hidden = false;
+  } else {
+    qualityWarning.hidden = true;
+  }
 
   // Score boxes — new 9-criteria /10 structure, with legacy fallback
   const scoresRow = document.getElementById('scoresRow');
