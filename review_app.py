@@ -405,6 +405,10 @@ def _friendly_error(e: Exception) -> str:
                 "Ask an admin to check/update the key in Manage Festival → Gemini API Key.")
     if "resource_exhausted" in low or "quota" in low or "429" in low:
         return "Gemini API quota exceeded for this festival's key. Please try again later or ask an admin to check the quota."
+    if "input token count exceeds" in low or "exceeds the maximum number of tokens" in low:
+        return ("This film is too long for Gemini to analyse in one pass (exceeds its 1M-token "
+                "context window). This can happen with long feature-length films even under our "
+                "120-minute limit. Please contact an admin to have it processed in chunks.")
     # Unrecognised error: don't leak internal details to the client. Log the full
     # exception server-side and hand the user a correlation id to quote in support.
     ref = uuid.uuid4().hex[:8]
@@ -661,6 +665,12 @@ def process_video(job_id: str, video_path: str, meta: dict):
                 # thinking_budget and produces malformed JSON — omitted intentionally.
                 thinking_config=types.ThinkingConfig(thinking_budget=0),
                 safety_settings=_FILM_SAFETY,
+                # Default video resolution tokenises at ~263 tok/s, which blows
+                # Gemini's 1,048,576-token context on anything past ~65 min —
+                # well under our 120-min direct-upload ceiling. LOW drops that
+                # to ~66 tok/s (~4+ hrs fits in-budget) at a modest detail cost,
+                # which is an acceptable trade-off for a token-limit hard failure.
+                media_resolution=types.MediaResolution.MEDIA_RESOLUTION_LOW,
             ),
         )
         analysis = _parse_json(_response_text(analysis_resp))
