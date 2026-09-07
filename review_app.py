@@ -1429,8 +1429,13 @@ def review_detail(film_id):
         return "Film not found", 404
 
     # Tenant scoping: only reveal a film (and its analysis) if it belongs to a
-    # festival the user may read. Return 404 (not 403) to avoid leaking existence.
-    if film.get("festival_key") not in _visible_festival_keys():
+    # festival the user may read, OR a review exists for it in one of those
+    # festivals. The review-existence check is the authoritative signal — it
+    # also covers films created before festival_key was recorded on the film
+    # document (legacy films would otherwise 404 for everyone).
+    visible_keys = _visible_festival_keys()
+    if film.get("festival_key") not in visible_keys and \
+       not any(db.review_get(film_id, fk) for fk in visible_keys):
         return "Film not found", 404
 
     if user_role == "admin":
@@ -1486,6 +1491,16 @@ def api_admin_festivals():
     for k, v in festivals.items():
         safe[k] = {fk: fv for fk, fv in v.items() if fk not in ("gemini_api_key", "wp_app_pass")}
     return jsonify(safe)
+
+
+@app.route("/admin/migrate/backfill-festival-keys", methods=["POST"])
+@admin_required
+def admin_backfill_festival_keys():
+    """One-time migration for the festival_key tenant-scoping regression —
+    see db.film_backfill_festival_keys(). Safe to call multiple times (idempotent:
+    only touches films still missing festival_key). Remove after running once."""
+    updated = db.film_backfill_festival_keys()
+    return jsonify({"films_updated": updated})
 
 
 @app.route("/admin")
@@ -1947,13 +1962,23 @@ def api_wp_preview(key):
 @limiter.limit("20 per minute")
 def api_publish_review(film_id):
     film = db.film_get(film_id)
-    if not film or film.get("festival_key") not in _visible_festival_keys():
+    if not film:
         return jsonify({"error": "Review not found"}), 404
-    fk = film.get("festival_key")
-    festival = get_festivals().get(fk) or {}
-    review = db.review_get(film_id, fk)
+    # Resolve which of the user's visible festivals actually has a review for
+    # this film — film.festival_key is absent on films created before it was
+    # recorded, so it can't be trusted alone (see review_detail for the same fix).
+    visible_keys = _visible_festival_keys()
+    fk = film.get("festival_key") if film.get("festival_key") in visible_keys else None
+    review = db.review_get(film_id, fk) if fk else None
     if not review:
+        for candidate_fk in visible_keys:
+            review = db.review_get(film_id, candidate_fk)
+            if review:
+                fk = candidate_fk
+                break
+    if not fk or not review:
         return jsonify({"error": "No review exists for this film yet."}), 400
+    festival = get_festivals().get(fk) or {}
     if not wordpress.wp_configured(festival):
         return jsonify({"error": "WordPress is not configured for this festival. "
                                  "Ask an admin to set it up under WordPress."}), 400

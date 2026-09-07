@@ -225,6 +225,25 @@ def film_create(data: dict) -> str:
     return film_id
 
 
+def film_backfill_festival_keys() -> int:
+    """One-time migration: films created before festival_key was recorded on
+    the film document have festival_key missing/empty, which breaks tenant
+    scoping (review_detail, api_publish_review, api_films all filter on it).
+    Derive festival_key from that film's earliest review and backfill it.
+    Returns the number of films updated."""
+    films_coll   = _get_db()["films"]
+    reviews_coll = _get_db()["reviews"]
+    updated = 0
+    for film in films_coll.find({"$or": [{"festival_key": {"$exists": False}}, {"festival_key": ""}]},
+                                 {"film_id": 1}):
+        review = reviews_coll.find_one({"film_id": film["film_id"]}, sort=[("created_at", ASCENDING)])
+        if review and review.get("festival_key"):
+            films_coll.update_one({"film_id": film["film_id"]},
+                                   {"$set": {"festival_key": review["festival_key"]}})
+            updated += 1
+    return updated
+
+
 def film_save_analysis(film_id: str, analysis: dict):
     """Write Gemini analysis into an existing film document."""
     _get_db()["films"].update_one(
