@@ -185,6 +185,187 @@ Recommend, 5.0-6.9 → Maybe, below 5 → Pass.
 """
 
 
+def _fmt_ts(seconds: float) -> str:
+    """Seconds → H:MM:SS / M:SS for use in prompts."""
+    s = int(seconds)
+    h, rem = divmod(s, 3600)
+    m, sec = divmod(rem, 60)
+    return f"{h}:{m:02d}:{sec:02d}" if h else f"{m}:{sec:02d}"
+
+
+def build_segment_analysis_prompt(festival: dict, film_meta: dict, seg_index: int,
+                                  seg_count: int, start_s: float, end_s: float,
+                                  runtime_min: float) -> str:
+    """Viewing notes for ONE window of the film.
+
+    A juror watches a feature in one sitting taking notes throughout; a single
+    model pass over 90+ minutes anchors on the opening instead. Each window is
+    analysed on its own so the back half of the film gets the same attention as
+    the first reel. Output is prose notes (not JSON) — the synthesis pass turns
+    the accumulated notes into scores.
+    """
+    film_meta = film_meta or {}
+    genre     = (film_meta.get("genre") or "").strip()
+    logline   = _cap_words((film_meta.get("logline") or "").strip())
+    dir_stmt  = _cap_words((film_meta.get("director_statement") or "").strip())
+
+    ctx = []
+    if genre:    ctx.append(f"Stated genre/category: {genre}")
+    if logline:  ctx.append(f"Logline: {logline}")
+    if dir_stmt: ctx.append(f"Director's statement: {dir_stmt}")
+    context_block = ("\nFILMMAKER-PROVIDED CONTEXT (use to understand intent):\n" + "\n".join(ctx)) if ctx else ""
+
+    where = (
+        "the OPENING of the film"          if seg_index == 0 else
+        "the CLOSING stretch of the film — including how it ends and whether it earns its ending"
+        if seg_index == seg_count - 1 else
+        "the MIDDLE of the film"
+    )
+
+    return f"""
+You are a professional film critic and senior festival juror taking detailed viewing
+notes for {festival['full_name']}. You are watching ONE SECTION of a film that runs
+{round(runtime_min)} minutes in total.
+
+THIS SECTION: part {seg_index + 1} of {seg_count}, covering {_fmt_ts(start_s)} to
+{_fmt_ts(end_s)} of the finished film. This is {where}.
+{context_block}
+
+Watch this section closely and write precise, evidence-based viewing notes. Every
+observation must be anchored to a specific moment. IMPORTANT: express all timestamps in
+ABSOLUTE film time (this section starts at {_fmt_ts(start_s)} of the full film, so a
+moment two minutes into this section is {_fmt_ts(start_s + 120)}). Never report a
+timestamp outside {_fmt_ts(start_s)}–{_fmt_ts(end_s)}.
+
+Cover, in plain prose (no JSON, no markdown headers):
+1. WHAT HAPPENS — the beats of this section, concretely, in order.
+2. DIRECTION & STAGING — blocking, tonal control, what the director is doing with the camera's attention.
+3. CINEMATOGRAPHY — composition, lighting, movement, colour. Name techniques precisely.
+4. PERFORMANCES — specific acting choices and whether they land (or 'no performers' if abstract).
+5. EDITING & PACING — rhythm within this section; exactly where it drags or accelerates.
+6. SOUND & MUSIC — score, sound design, mix, dialogue intelligibility.
+7. WRITING — dialogue, subtext, theme as they surface here (or conceptual writing for non-narrative work).
+8. STRONGEST MOMENT in this section, with timestamp, and why it works.
+9. WEAKEST MOMENT in this section, with timestamp, and what specifically undermines it.
+
+Be specific and unsparing but fair. Do not summarise the whole film — report only what
+you actually observe in THIS section. If the section is largely uneventful, say so
+plainly rather than inventing incident.
+"""
+
+
+def build_synthesis_prompt(festival: dict, film_meta: dict, segment_notes: list[str],
+                           runtime_min: float) -> str:
+    """Turn accumulated per-section viewing notes into the final scored assessment.
+
+    Produces the same JSON shape as build_analysis_prompt() so all downstream
+    review-writing and display code is unchanged.
+    """
+    film_meta = film_meta or {}
+    focus     = festival.get("analysis_focus", "").strip()
+    genre     = (film_meta.get("genre") or "").strip()
+    logline   = _cap_words((film_meta.get("logline") or "").strip())
+    dir_stmt  = _cap_words((film_meta.get("director_statement") or "").strip())
+
+    cat_prompts   = festival.get("category_prompts", {}) or {}
+    cat_emphasis  = (cat_prompts.get(genre, "") or "").strip()
+    category_block = (
+        f"\nCATEGORY-SPECIFIC JUDGING EMPHASIS for the '{genre}' category"
+        f" (takes priority for this submission):\n{cat_emphasis}"
+    ) if cat_emphasis else ""
+
+    ctx = []
+    if genre:    ctx.append(f"Stated genre/category: {genre}")
+    if logline:  ctx.append(f"Logline: {logline}")
+    if dir_stmt: ctx.append(f"Director's statement: {dir_stmt}")
+    context_block = ("\nFILMMAKER-PROVIDED CONTEXT (use to understand intent):\n" + "\n".join(ctx)) if ctx else ""
+
+    notes_block = "\n\n".join(
+        f"───── VIEWING NOTES, SECTION {i + 1} of {len(segment_notes)} ─────\n{n}"
+        for i, n in enumerate(segment_notes)
+    )
+
+    return f"""
+You are a professional film critic and senior festival juror with 15 years of
+experience across narrative, documentary, experimental, animation, and music-driven
+work — the calibre of reviewer published in Variety or Sight & Sound. You have just
+watched a {round(runtime_min)}-minute film for {festival['full_name']}, which focuses
+on {festival['focus']}, and taken the section-by-section notes below across its ENTIRE
+runtime. Now deliver your considered verdict.
+
+FESTIVAL JUDGING EMPHASIS:
+{focus}
+{category_block}
+{context_block}
+
+{notes_block}
+
+───── YOUR TASK ─────
+
+STEP 1 — IDENTIFY THE FORM (narrative short/feature, documentary, experimental/art
+film, music video, animation, dance/poetry film, or hybrid), then judge the film ON ITS
+OWN TERMS. Do NOT penalise an intentionally non-narrative or dialogue-free work for
+lacking plot or dialogue. Where a director's statement is given, assess realisation of
+the STATED intent.
+
+STEP 2 — JUDGE THE FILM AS A WHOLE. Your notes span the full runtime; your assessment
+must too. Weigh how the film develops, whether the middle sustains what the opening
+promises, and whether the ending earns itself. A film that opens strongly and collapses
+is not a strong film, and vice versa.
+
+STEP 3 — SCORE EACH OF THE NINE CRITERIA from 0 to 10 (whole numbers). For any
+criterion that genuinely does not apply to this film's form, award a fair score based
+on the closest equivalent craft rather than a low score (and say so in the note).
+
+EVIDENCE RULE — every note must cite at least one concrete timestamped moment drawn
+from your notes. Across the nine notes as a whole you MUST cite moments from the
+beginning, the middle, AND the final section of the film. Do not cite only the opening.
+
+Return ONLY valid JSON — no markdown, no preamble:
+{{
+  "form": "<the film type you identified>",
+  "ratings": {{
+    "originality": <0-10>,
+    "direction": <0-10>,
+    "writing": <0-10>,
+    "cinematography": <0-10>,
+    "performances": <0-10>,
+    "production_value": <0-10>,
+    "pacing": <0-10>,
+    "structure": <0-10>,
+    "sound_music": <0-10>
+  }},
+  "notes": {{
+    "originality": "<2-3 sentences: freshness of concept, voice, what sets it apart>",
+    "direction": "<2-3 sentences: directorial command, staging, visual storytelling, tonal control>",
+    "writing": "<2-3 sentences: script/concept — dialogue, subtext, theme; for non-narrative, conceptual writing>",
+    "cinematography": "<2-3 sentences: composition, lighting, camera movement, colour — cite a timestamp>",
+    "performances": "<2-3 sentences: acting truth/range/presence; 'N/A — no performers' for abstract work, judge the nearest equivalent>",
+    "production_value": "<2-3 sentences: scope, design, polish relative to evident resources>",
+    "pacing": "<2-3 sentences: rhythm across the WHOLE runtime, where it drags or sings — cite timestamps from different parts of the film>",
+    "structure": "<2-3 sentences: architecture, escalation, how beginning/middle/end hold — must address how the film ENDS>",
+    "sound_music": "<2-3 sentences: score, sound design, mix, dialogue clarity>"
+  }},
+  "arc": "<2-3 sentences tracing how the film develops from opening through middle to ending — the throughline a single-scene look would miss>",
+  "overall_rating": <0-10, your holistic professional verdict — close to but not mechanically the average>,
+  "standout_moment": "<the single strongest moment in the FILM, with its timestamp>",
+  "weakest_element": "<the most important, constructive area to improve, be specific>",
+  "festival_suitability": "<1-2 sentences on audience and circuit fit for {festival['name']}>",
+  "recommendation": "<Pass | Recommend | Award Worthy | Maybe>"
+}}
+
+CALIBRATION (0-10, festival-submission context — be fair and discerning, not stingy):
+0-2 = fundamentally broken craft (rare)   3-4 = notable weaknesses, early-stage
+5-6 = competent and screenable baseline    7-8 = strong, distinctive, programme-worthy
+9-10 = exceptional, award-calibre execution of its form.
+Most accomplished festival films land at 6-8. Reserve 0-4 for genuinely deficient
+craft, and award 9-10 only when a film truly excels at what it sets out to do —
+including abstract or experimental excellence.
+RECOMMENDATION must follow the overall_rating: 8.5-10 → Award Worthy, 7.0-8.4 →
+Recommend, 5.0-6.9 → Maybe, below 5 → Pass.
+"""
+
+
 def build_long_film_analysis_prompt(festival: dict) -> str:
     """
     Analysis prompt for feature films processed via keyframes + transcript.
@@ -321,6 +502,8 @@ def build_review_prompt(film_meta: dict, analysis: dict, festival: dict) -> str:
     standout    = a.get("standout_moment", "")
     weakest     = a.get("weakest_element", "")
     suitability = a.get("festival_suitability", "")
+    arc         = a.get("arc", "")
+    arc_block   = f"\nWhole-film arc:   {arc}" if arc else ""
 
     return f"""
 You are a professional film critic and senior programmer at {festival['full_name']},
@@ -345,7 +528,7 @@ Overall Rating: {overall:.1f}/10
 {scores_block}
 Standout moment:  {standout}
 Weakest element:  {weakest}
-Festival fit:     {suitability}
+Festival fit:     {suitability}{arc_block}
 
 OUTPUT FORMAT — reproduce EXACTLY this structure and order:
 
@@ -387,6 +570,9 @@ WRITING RULES FOR THE COMMENTS:
 - Address each major dimension that matters for this film with real critical insight,
   not surface praise; reference concrete moments and name techniques precisely.
 - Pair every weakness with a concrete, actionable suggestion ("try…", "consider…").
+- Demonstrate that you watched the WHOLE film: draw on moments from its later stretches
+  as well as its opening, and say something specific about how the film ends. A review
+  that only discusses the first few minutes reads as if the film was never finished.
 - Where it illuminates a point, weave in a brief piece of craft wisdom (how editors,
   DPs, or directors handle a similar challenge) — relevant, never name-dropping.
 - Critique the work, never the person; no sarcasm. The filmmaker should finish

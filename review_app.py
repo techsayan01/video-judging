@@ -15,7 +15,7 @@ Cost optimisations applied:
      cost $3.50/1M; disabled with thinking_budget=0 on prose generation.
 """
 
-import os, json, uuid, threading, tempfile, time, re, secrets, logging
+import os, json, uuid, threading, tempfile, time, re, secrets, logging, math
 from pathlib import Path
 from datetime import datetime, timezone
 from functools import wraps
@@ -32,7 +32,8 @@ from dotenv import load_dotenv
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 from festivals import FESTIVALS as SEED_FESTIVALS, DEFAULT_FESTIVAL, get_festival, DOMAIN_FESTIVAL_MAP
-from prompts import build_analysis_prompt, build_review_prompt, _cap_words
+from prompts import (build_analysis_prompt, build_review_prompt, _cap_words,
+                     build_segment_analysis_prompt, build_synthesis_prompt)
 import db
 import wordpress
 
@@ -449,7 +450,98 @@ def _gemini_generate_with_retry(client, model_id: str, contents, config,
     return resp  # final attempt result, callers handle the empty case
 
 
-def _analyse_video_with_resolution_fallback(client, model_id: str, contents, base_config: dict, job_id: str):
+# ── Segmented viewing ─────────────────────────────────────
+# A single model pass over a 90-minute film anchors on the opening: an audit of
+# stored reviews found 86% of all cited moments fell in the first fifth of the
+# runtime and none in the final fifth — no review ever discussed an ending.
+# Instead we watch the film in windows, take notes on each (with thinking budget
+# so the reasoning is real), then synthesise the scores from the full set of
+# notes — which is how a juror actually watches a feature.
+_SEGMENT_TARGET_MIN  = 10    # aim for ~10-minute viewing windows
+_SEGMENT_MAX         = 12    # cap windows so a 2-hour film stays bounded
+_SEGMENT_WORKERS     = 3     # concurrent segment calls (API calls are I/O bound)
+_SEGMENT_THINKING    = 4096  # thinking budget per segment — depth lives here
+_SEGMENT_MAX_OUTPUT  = 4096
+
+
+def _segment_windows(runtime_min: float) -> list[tuple[float, float]]:
+    """Split a runtime into viewing windows of roughly _SEGMENT_TARGET_MIN each.
+    Returns [(start_seconds, end_seconds), ...] — always at least one window."""
+    total_s = max(float(runtime_min or 0), 0.0) * 60
+    if total_s <= 0:
+        return [(0.0, 0.0)]
+    n = max(1, min(math.ceil(runtime_min / _SEGMENT_TARGET_MIN), _SEGMENT_MAX))
+    step = total_s / n
+    return [(i * step, min((i + 1) * step, total_s)) for i in range(n)]
+
+
+def _analyse_film_in_segments(client, model_id: str, file_obj, festival: dict,
+                               meta: dict, runtime_min: float, job_id: str):
+    """Watch the film window by window, then synthesise a scored assessment.
+    Returns (analysis_dict, used_low_resolution)."""
+    windows   = _segment_windows(runtime_min)
+    total     = len(windows)
+    notes     = [""] * total
+    used_low  = False
+    done      = 0
+    lock      = threading.Lock()
+
+    seg_config = {
+        "temperature":     0.3,
+        "max_output_tokens": _SEGMENT_MAX_OUTPUT,
+        "thinking_config": types.ThinkingConfig(thinking_budget=_SEGMENT_THINKING),
+        "safety_settings": _FILM_SAFETY,
+    }
+
+    def _watch(i: int) -> tuple[int, str, bool]:
+        start_s, end_s = windows[i]
+        part = types.Part(
+            file_data=types.FileData(file_uri=file_obj.uri, mime_type=file_obj.mime_type),
+            video_metadata=types.VideoMetadata(start_offset=f"{int(start_s)}s",
+                                                end_offset=f"{int(math.ceil(end_s))}s"),
+        )
+        prompt = build_segment_analysis_prompt(festival, meta, i, total,
+                                                start_s, end_s, runtime_min)
+        resp, low = _analyse_video_with_resolution_fallback(
+            client, model_id, [part, prompt], seg_config, job_id, notify=False)
+        return i, _response_text(resp).strip(), low
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    with ThreadPoolExecutor(max_workers=min(_SEGMENT_WORKERS, total)) as pool:
+        futures = [pool.submit(_watch, i) for i in range(total)]
+        for fut in as_completed(futures):
+            i, text, low = fut.result()
+            notes[i] = text
+            with lock:
+                used_low = used_low or low
+                done += 1
+                # Segment viewing spans progress 65 → 85
+                db.job_update(job_id, {
+                    "status": "analysing",
+                    "progress": 65 + int(20 * done / total),
+                    "message": f"Watching the film in detail — section {done} of {total}…",
+                })
+
+    db.job_update(job_id, {"status": "analysing", "progress": 86,
+                            "message": "Weighing the film as a whole…"})
+    # Synthesis runs without a thinking budget: the deep reasoning already happened
+    # per segment, and thinking on this call is what previously produced malformed
+    # JSON. Keeping it at 0 protects the one step that must parse reliably.
+    synth_resp = _gemini_generate_with_retry(
+        client, model_id,
+        build_synthesis_prompt(festival, meta, notes, runtime_min),
+        types.GenerateContentConfig(
+            temperature=0.3,
+            max_output_tokens=8192,
+            thinking_config=types.ThinkingConfig(thinking_budget=0),
+            safety_settings=_FILM_SAFETY,
+        ),
+    )
+    return _parse_json(_response_text(synth_resp)), used_low
+
+
+def _analyse_video_with_resolution_fallback(client, model_id: str, contents, base_config: dict,
+                                             job_id: str, notify: bool = True):
     """Run the video analysis call at default resolution first (best detail).
     If the film is long enough to blow Gemini's 1,048,576-token context window
     (default video tokenisation is ~263 tok/s — anything past ~65 min can overflow,
@@ -470,8 +562,9 @@ def _analyse_video_with_resolution_fallback(client, model_id: str, contents, bas
             raise
         logging.warning("[analysis] job %s exceeded token budget at default resolution — "
                          "retrying at low resolution", job_id)
-        db.job_update(job_id, {"status": "analysing", "progress": 65,
-                                "message": "Film is long — retrying at reduced detail to fit Gemini's context window…"})
+        if notify:
+            db.job_update(job_id, {"status": "analysing", "progress": 65,
+                                    "message": "Film is long — retrying at reduced detail to fit Gemini's context window…"})
         low_config = dict(base_config)
         low_config["media_resolution"] = types.MediaResolution.MEDIA_RESOLUTION_LOW
         resp = _gemini_generate_with_retry(
@@ -682,24 +775,13 @@ def process_video(job_id: str, video_path: str, meta: dict):
             db.job_update(job_id, {"status": "processing", "progress": progress, "message": msg})
         if f.state.name != "ACTIVE":
             raise RuntimeError(f"Gemini video processing failed: {f.state.name}")
-        analysis_contents = [f, build_analysis_prompt(festival, meta)]
-
         # ── 3. Score & analyse ────────────────────────────────────────────
+        # Watch the film in windows and synthesise, so the back half of a feature
+        # gets the same scrutiny as its opening reel (see _analyse_film_in_segments).
         db.job_update(job_id, {"status": "analysing", "progress": 65,
                                 "message": "Scoring story, direction & craft…"})
-        analysis_resp, used_low_res = _analyse_video_with_resolution_fallback(
-            client, model_id, analysis_contents,
-            {
-                "temperature": 0.3,
-                "max_output_tokens": 8192,
-                # NOTE: response_mime_type="application/json" conflicts with
-                # thinking_budget and produces malformed JSON — omitted intentionally.
-                "thinking_config": types.ThinkingConfig(thinking_budget=0),
-                "safety_settings": _FILM_SAFETY,
-            },
-            job_id,
-        )
-        analysis = _parse_json(_response_text(analysis_resp))
+        analysis, used_low_res = _analyse_film_in_segments(
+            client, model_id, f, festival, meta, duration_min, job_id)
         if used_low_res:
             analysis["quality_warning"] = (
                 "This film exceeded Gemini's analysis context window at full detail, so it was "
@@ -3670,6 +3752,7 @@ REVIEW_DETAIL_BODY = """<div class="main">
       {% if a.standout_moment %}<div class="obs-item standout"><span class="obs-lbl">Standout Moment</span><div class="obs-body">{{ a.standout_moment }}</div></div>{% endif %}
       {% if a.weakest_element %}<div class="obs-item weakest"><span class="obs-lbl">Growth Area</span><div class="obs-body">{{ a.weakest_element }}</div></div>{% endif %}
     </div>
+    {% if a.get('arc') %}<div class="obs-item" style="margin-top:12px"><span class="obs-lbl">Whole-Film Arc</span><div class="obs-body">{{ a.get('arc') }}</div></div>{% endif %}
     {% if a.festival_suitability %}<div class="obs-item" style="margin-top:12px"><span class="obs-lbl">Festival Suitability</span><div class="obs-body">{{ a.festival_suitability }}</div></div>{% endif %}
   </div>
   {% endif %}
@@ -4246,7 +4329,10 @@ function pollStatus(jobId) {
   clearInterval(pollInterval);
   activeJobId = jobId;   // arm the unload guard
   let elapsed = 0;
-  const MAX_WAIT = 20 * 60 * 1000; // 20 min hard timeout
+  // A feature film is now watched in ~10 sections, each with a thinking budget,
+  // on top of upload + Gemini's own file processing. 20 min was cutting long
+  // films off mid-analysis; Cloud Run's request timeout is 60 min.
+  const MAX_WAIT = 45 * 60 * 1000; // 45 min hard timeout
 
   const finish = () => { clearInterval(pollInterval); activeJobId = null; };
 
@@ -4378,11 +4464,15 @@ function showResults(job) {
   // Observation grid
   const obsGrid = document.getElementById('obsGrid');
   obsGrid.textContent = '';
-  obsGrid.append(
-    _obsItem('Standout Moment', a.standout_moment || '', 'standout'),
-    _obsItem('Growth Area',     a.weakest_element || '', 'weakest'),
-    _obsItem('Festival Suitability', a.festival_suitability || '', '', 'grid-column:1/-1'),
-  );
+  // Skip blanks so legacy analyses (no 'arc') don't render empty boxes
+  [
+    ['Standout Moment', a.standout_moment, 'standout', ''],
+    ['Growth Area',     a.weakest_element, 'weakest',  ''],
+    ['Whole-Film Arc',  a.arc,             '',         'grid-column:1/-1'],
+    ['Festival Suitability', a.festival_suitability, '', 'grid-column:1/-1'],
+  ].forEach(([label, text, cls, span]) => {
+    if (text) obsGrid.append(_obsItem(label, text, cls, span));
+  });
 
   // Review text — already uses textContent
   document.getElementById('reviewText').textContent = job.review || '';
