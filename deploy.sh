@@ -23,6 +23,25 @@ else
   gcloud builds submit --tag "$IMAGE" --project "$PROJECT_ID" .
 fi
 
+# ── COST NOTICE — read before changing the flags below ────────────────────────
+# --min-instances 1 + --no-cpu-throttling means one instance is billed 24/7,
+# whether or not anyone submits a film. Measured Sept 2026: a constant
+# 24.0 instance-hours/day (~746 h/month). At 4 vCPU that was ~$215/month
+# (~Rs 18k) and the invoice is what took the project offline.
+#
+# CPU dominates that bill (~90%); memory is ~$21/month. Hence cpu=2, not 4 —
+# the workload is I/O-bound (GCS download, Gemini upload, waiting on Gemini),
+# so 2 vCPU is ample. Memory stays at 4Gi on purpose: Cloud Run's /tmp is
+# RAM-backed and process_video writes 1 GB+ videos there, so lowering it
+# risks OOM on feature-length films. Note Cloud Run also requires >=2 vCPU
+# for 4Gi of memory.
+#
+# min-instances CANNOT go to 0 until film processing moves out of the detached
+# background threads in review_app.py and into a request boundary (Cloud Run
+# Jobs / Cloud Tasks) — scaling to zero today would kill in-flight reviews.
+# That change is what takes idle cost to ~zero.
+#
+# Before changing cpu/memory/min-instances, compute: rate x 730 h = monthly idle cost.
 echo "Deploying to Cloud Run ($REGION)..."
 gcloud run deploy "$SERVICE_NAME" \
   --image "$IMAGE" \
@@ -30,7 +49,7 @@ gcloud run deploy "$SERVICE_NAME" \
   --region "$REGION" \
   --project "$PROJECT_ID" \
   --memory 4Gi \
-  --cpu 4 \
+  --cpu 2 \
   --no-cpu-throttling \
   --timeout 3600 \
   --concurrency 5 \
