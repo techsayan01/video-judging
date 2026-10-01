@@ -54,6 +54,7 @@ gcloud run deploy "$SERVICE_NAME" \
   --project "$PROJECT_ID" \
   --memory 4Gi \
   --cpu 2 \
+  --cpu-throttling \
   --timeout 3600 \
   --concurrency 5 \
   --min-instances 0 \
