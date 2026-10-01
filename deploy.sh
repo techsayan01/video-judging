@@ -24,22 +24,26 @@ else
 fi
 
 # ── COST NOTICE — read before changing the flags below ────────────────────────
-# --min-instances 1 + --no-cpu-throttling means one instance is billed 24/7,
-# whether or not anyone submits a film. Measured Sept 2026: a constant
-# 24.0 instance-hours/day (~746 h/month). At 4 vCPU that was ~$215/month
-# (~Rs 18k) and the invoice is what took the project offline.
+# This service is billed ONLY while a request is in flight. That is deliberate
+# and the whole cost model depends on it:
 #
-# CPU dominates that bill (~90%); memory is ~$21/month. Hence cpu=2, not 4 —
-# the workload is I/O-bound (GCS download, Gemini upload, waiting on Gemini),
-# so 2 vCPU is ample. Memory stays at 4Gi on purpose: Cloud Run's /tmp is
-# RAM-backed and process_video writes 1 GB+ videos there, so lowering it
-# risks OOM on feature-length films. Note Cloud Run also requires >=2 vCPU
-# for 4Gi of memory.
+#   --min-instances 0   nothing is billed when idle
+#   (no --no-cpu-throttling)  request-based billing, so no idle instance charge
 #
-# min-instances CANNOT go to 0 until film processing moves out of the detached
-# background threads in review_app.py and into a request boundary (Cloud Run
-# Jobs / Cloud Tasks) — scaling to zero today would kill in-flight reviews.
-# That change is what takes idle cost to ~zero.
+# Film processing runs inside a request (Cloud Tasks -> /internal/process), so
+# the instance lives exactly as long as the work. Setting --min-instances above
+# 0, or re-adding --no-cpu-throttling, reinstates a 24/7 charge: that cost
+# Rs ~10k/month in Sept 2026 (a flat 24.0 instance-hours/day whether or not any
+# film was submitted) and the invoice is what took the project offline.
+#
+# Memory stays at 4Gi: Cloud Run's /tmp is RAM-backed and process_video pulls
+# 1 GB+ videos into it. Cloud Run also requires >=2 vCPU for 4Gi. The Cloud
+# Tasks queue caps concurrency at 2 so two jobs cannot exhaust that RAM.
+#
+# There is deliberately NO VPC connector / Cloud NAT. That stack cost
+# Rs ~4,325/month and existed only to give Atlas a fixed IP to allowlist;
+# Atlas is now reached over the public internet, protected by TLS + SCRAM auth.
+# Re-adding it means paying that again.
 #
 # Before changing cpu/memory/min-instances, compute: rate x 730 h = monthly idle cost.
 echo "Deploying to Cloud Run ($REGION)..."
@@ -50,15 +54,14 @@ gcloud run deploy "$SERVICE_NAME" \
   --project "$PROJECT_ID" \
   --memory 4Gi \
   --cpu 2 \
-  --no-cpu-throttling \
   --timeout 3600 \
   --concurrency 5 \
-  --min-instances 1 \
+  --min-instances 0 \
   --max-instances 5 \
   --allow-unauthenticated \
-  --vpc-connector fr-connector \
-  --vpc-egress all-traffic \
-  --set-env-vars "HTTPS=true,GCS_UPLOAD_BUCKET=festival-reviewer-uploads" \
+  --set-env-vars "HTTPS=true,GCS_UPLOAD_BUCKET=festival-reviewer-uploads,\
+GCP_PROJECT=$PROJECT_ID,TASKS_QUEUE=festival-reviewer-jobs,TASKS_LOCATION=$REGION,\
+SERVICE_URL=https://festival-reviewer-e53sualg4a-el.a.run.app" \
   --set-secrets \
     "FLASK_SECRET=flask-secret:latest,\
 GEMINI_API_KEY=gemini-api-key:latest,\
@@ -67,6 +70,7 @@ ADMIN_1_EMAIL=admin-1-email:latest,\
 ADMIN_1_PASS=admin-1-pass:latest,\
 ADMIN_2_EMAIL=admin-2-email:latest,\
 ADMIN_2_PASS=admin-2-pass:latest,\
+INTERNAL_TOKEN=internal-token:latest,\
 YT_PROXY=yt-proxy:latest"
 
 echo ""

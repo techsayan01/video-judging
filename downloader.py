@@ -106,6 +106,20 @@ def generate_upload_url(bucket: str, blob_name: str, content_type: str = "video/
     )
 
 
+def upload_to_gcs(local_path: str, bucket: str, blob_name: str,
+                  content_type: str = "application/octet-stream") -> str:
+    """Upload a local file to GCS and return the blob name.
+    Used so a job's input survives beyond the request that received it — the
+    worker that processes the job runs on a different Cloud Run instance and
+    cannot see the uploading instance's /tmp.
+    """
+    from google.cloud import storage as gcs_lib
+    blob = gcs_lib.Client().bucket(bucket).blob(blob_name)
+    blob.upload_from_filename(local_path, content_type=content_type)
+    print(f"  [gcs] Uploaded {local_path} -> gs://{bucket}/{blob_name}")
+    return blob_name
+
+
 def download_from_gcs(bucket: str, blob_name: str, dest_path: str) -> dict:
     """Download a GCS object to a local path. Returns duration + size info."""
     from google.cloud import storage as gcs_lib

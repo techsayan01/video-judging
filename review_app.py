@@ -450,6 +450,112 @@ def _gemini_generate_with_retry(client, model_id: str, contents, config,
     return resp  # final attempt result, callers handle the empty case
 
 
+# ── Job dispatch (Cloud Tasks) ────────────────────────────
+# Processing used to run in a detached threading.Thread after the HTTP response
+# returned. Cloud Run only keeps an instance alive while a request is in flight,
+# so that design forced min-instances=1 and billed a container 24/7 (~Rs 10k/mo)
+# even when no film was submitted. Now the request only enqueues, and Cloud Tasks
+# POSTs the job back to /internal/process where the work runs INSIDE a request —
+# so the instance lives exactly as long as the work, and min-instances can be 0.
+TASKS_QUEUE    = os.getenv("TASKS_QUEUE", "festival-reviewer-jobs")
+TASKS_LOCATION = os.getenv("TASKS_LOCATION", "asia-south1")
+GCP_PROJECT    = os.getenv("GCP_PROJECT", "personal-workspace-490012")
+SERVICE_URL    = os.getenv("SERVICE_URL", "").rstrip("/")
+INTERNAL_TOKEN = os.getenv("INTERNAL_TOKEN", "")
+
+# Cloud Tasks caps an HTTP target's dispatch deadline at 30 min. A job that runs
+# longer is retried, so /internal/process is idempotent (see _claim_job).
+_TASK_DEADLINE_S = 1800
+
+
+def _enqueue_job(job_id: str, kind: str) -> None:
+    """Hand a job to Cloud Tasks. Falls back to an in-process thread when the
+    queue is not configured (local dev), preserving the old behaviour there."""
+    if not SERVICE_URL or not INTERNAL_TOKEN:
+        logging.warning("[dispatch] Cloud Tasks not configured — running job %s inline", job_id)
+        threading.Thread(target=_run_job, args=(job_id,), daemon=True).start()
+        return
+    from google.cloud import tasks_v2
+    client = tasks_v2.CloudTasksClient()
+    client.create_task(
+        parent=client.queue_path(GCP_PROJECT, TASKS_LOCATION, TASKS_QUEUE),
+        task={
+            "http_request": {
+                "http_method": tasks_v2.HttpMethod.POST,
+                "url": f"{SERVICE_URL}/internal/process",
+                "headers": {"Content-Type": "application/json",
+                            "X-Internal-Token": INTERNAL_TOKEN},
+                "body": json.dumps({"job_id": job_id}).encode(),
+            },
+            "dispatch_deadline": {"seconds": _TASK_DEADLINE_S},
+        },
+    )
+    logging.info("[dispatch] queued job %s kind=%s", job_id, kind)
+
+
+def _claim_job(job_id: str) -> dict | None:
+    """Return the job if this worker should process it, else None.
+    Guards against Cloud Tasks retrying a job that already finished or is still
+    being worked on by another attempt."""
+    job = db.job_get(job_id)
+    if not job:
+        logging.error("[dispatch] job %s not found", job_id)
+        return None
+    if job.get("status") in ("done", "error"):
+        logging.info("[dispatch] job %s already terminal (%s) — skipping", job_id, job.get("status"))
+        return None
+    updated = job.get("updated_at")
+    if isinstance(updated, str):
+        try:
+            updated = datetime.fromisoformat(updated.replace("Z", "+00:00"))
+        except ValueError:
+            updated = None
+    if isinstance(updated, datetime) and job.get("status") not in ("queued",):
+        if updated.tzinfo is None:
+            updated = updated.replace(tzinfo=timezone.utc)
+        age_min = (datetime.now(timezone.utc) - updated).total_seconds() / 60
+        if age_min < _STALE_JOB_MINUTES:
+            logging.info("[dispatch] job %s already in progress (%.1f min old) — skipping",
+                         job_id, age_min)
+            return None
+    return job
+
+
+def _run_job(job_id: str) -> None:
+    """Execute a queued job. Reconstructs everything from the job document so it
+    can run on any instance, not just the one that accepted the upload."""
+    job = _claim_job(job_id)
+    if not job:
+        return
+    meta = job.get("meta") or {}
+    kind = job.get("kind") or "video"
+    try:
+        if kind == "rewrite":
+            film = db.film_get(meta.get("film_id", ""))
+            if not film:
+                raise RuntimeError("Cached film for this review no longer exists.")
+            process_rewrite(job_id, film, meta)
+        elif kind == "document":
+            bucket = os.getenv("GCS_UPLOAD_BUCKET", "")
+            ext    = meta.get("doc_ext", ".pdf")
+            tmp    = tempfile.NamedTemporaryFile(suffix=ext, delete=False).name
+            from downloader import download_from_gcs, delete_from_gcs
+            dl = download_from_gcs(bucket, meta.get("doc_blob", ""), tmp)
+            if not dl["success"]:
+                raise RuntimeError(dl.get("error", "Could not retrieve the uploaded document"))
+            try:
+                process_document(job_id, tmp, ext, meta)
+            finally:
+                Path(tmp).unlink(missing_ok=True)
+                try: delete_from_gcs(bucket, meta.get("doc_blob", ""))
+                except Exception: pass
+        else:
+            process_video(job_id, None, meta)
+    except Exception as e:
+        logging.exception("[dispatch] job %s failed before/around processing", job_id)
+        db.job_update(job_id, {"status": "error", "progress": 0, "message": _friendly_error(e)})
+
+
 # ── Segmented viewing ─────────────────────────────────────
 # A single model pass over a 90-minute film anchors on the opening: an audit of
 # stored reviews found 86% of all cited moments fell in the first fifth of the
@@ -1119,6 +1225,27 @@ def check_dedup():
     return jsonify({"found": found})
 
 
+@app.route("/internal/process", methods=["POST"])
+@limiter.exempt
+def internal_process():
+    """Cloud Tasks worker. Runs the job synchronously so the instance stays alive
+    for its duration — this is what lets min-instances be 0.
+
+    Not behind @login_required (Cloud Tasks has no session); authenticated by a
+    shared secret held in Secret Manager. Returns 200 even on job failure so the
+    task is not retried — the error is already recorded on the job document and a
+    retry would re-run an expensive Gemini analysis for nothing.
+    """
+    if not INTERNAL_TOKEN or request.headers.get("X-Internal-Token") != INTERNAL_TOKEN:
+        logging.warning("[internal] rejected unauthenticated /internal/process call")
+        return jsonify({"error": "forbidden"}), 403
+    job_id = (request.get_json(silent=True) or {}).get("job_id", "")
+    if not job_id:
+        return jsonify({"error": "job_id required"}), 400
+    _run_job(job_id)
+    return jsonify({"ok": True})
+
+
 @app.route("/upload", methods=["POST"])
 @login_required
 @limiter.limit("5 per minute; 30 per hour")
@@ -1184,8 +1311,9 @@ def upload():
             job_id = uuid.uuid4().hex
             db.job_create(job_id, {"status": "queued", "progress": 5,
                                    "message": "Found existing analysis — writing review…",
-                                   "meta": meta, "analysis": None, "review": None})
-            threading.Thread(target=process_rewrite, args=(job_id, existing, meta), daemon=True).start()
+                                   "meta": meta, "kind": "rewrite",
+                                   "analysis": None, "review": None})
+            _enqueue_job(job_id, "rewrite")
             return jsonify({"job_id": job_id, "from_cache": True})
 
         if not has_doc:
@@ -1214,13 +1342,25 @@ def upload():
             "genre": genre, "synopsis": synopsis,
             "festival_key": festival_key, "festival_name": festival["name"], "season": season,
         }
+        # Park the document in GCS so the Cloud Tasks worker — which runs on a
+        # different instance — can fetch it. Same 1-day lifecycle as videos.
+        from downloader import upload_to_gcs
+        doc_blob = f"uploads/{uuid.uuid4().hex}{ext}"
+        try:
+            upload_to_gcs(tmp.name, os.getenv("GCS_UPLOAD_BUCKET", ""), doc_blob)
+        finally:
+            Path(tmp.name).unlink(missing_ok=True)
+        meta["doc_blob"] = doc_blob
+        meta["doc_ext"]  = ext
+
         job_id = uuid.uuid4().hex
         db.job_create(job_id, {"status": "queued", "progress": 5,
                                "message": "Queued — reading your script…",
-                               "meta": meta, "analysis": None, "review": None})
+                               "meta": meta, "kind": "document",
+                               "analysis": None, "review": None})
         logging.info("[upload] SCRIPT job queued film_id=%s festival=%s category=%r user=%s",
                      film_id, festival_key, genre, session.get("user"))
-        threading.Thread(target=process_document, args=(job_id, tmp.name, ext, meta), daemon=True).start()
+        _enqueue_job(job_id, "document")
         return jsonify({"job_id": job_id})
 
     # ── Per-festival dedup ─────────────────────────────────
@@ -1260,12 +1400,11 @@ def upload():
         db.job_create(job_id, {
             "status": "queued", "progress": 5,
             "message": "Found existing analysis — writing review (no re-upload)…",
-            "meta": meta, "analysis": None, "review": None,
+            "meta": meta, "kind": "rewrite", "analysis": None, "review": None,
         })
         logging.info("[upload] DEDUP hit — reusing film_id=%s for festival=%s (title=%r director=%r)",
                      existing["film_id"], festival_key, title, director)
-        threading.Thread(target=process_rewrite,
-                         args=(job_id, existing, meta), daemon=True).start()
+        _enqueue_job(job_id, "rewrite")
         return jsonify({"job_id": job_id, "from_cache": True})
 
     # ── No dedup hit → a video is required ────────────────
@@ -1289,7 +1428,14 @@ def upload():
         if size_mb > MAX_UPLOAD_MB:
             Path(tmp.name).unlink(missing_ok=True)
             return jsonify({"error": f"File too large ({size_mb:.0f}MB). Max {MAX_UPLOAD_MB}MB"}), 400
-        video_path = tmp.name
+        # Direct POST path: hand the file to GCS so the Cloud Tasks worker can
+        # reach it. Large uploads normally arrive as gcs_blob already.
+        from downloader import upload_to_gcs
+        gcs_blob = f"uploads/{uuid.uuid4().hex}.mp4"
+        try:
+            upload_to_gcs(tmp.name, os.getenv("GCS_UPLOAD_BUCKET", ""), gcs_blob, "video/mp4")
+        finally:
+            Path(tmp.name).unlink(missing_ok=True)
 
     film_id = uuid.uuid4().hex
     db.film_create({
@@ -1325,10 +1471,9 @@ def upload():
     db.job_create(job_id, {
         "status": "queued", "progress": 5,
         "message": "Queued for processing...",
-        "meta": meta, "analysis": None, "review": None,
+        "meta": meta, "kind": "video", "analysis": None, "review": None,
     })
-    threading.Thread(target=process_video,
-                     args=(job_id, video_path, meta), daemon=True).start()
+    _enqueue_job(job_id, "video")
     return jsonify({"job_id": job_id})
 
 
@@ -1372,10 +1517,9 @@ def rewrite():
     db.job_create(job_id, {
         "status": "queued", "progress": 5,
         "message": "Loading cached analysis...",
-        "meta": meta, "analysis": None, "review": None,
+        "meta": meta, "kind": "rewrite", "analysis": None, "review": None,
     })
-    threading.Thread(target=process_rewrite,
-                     args=(job_id, film, meta), daemon=True).start()
+    _enqueue_job(job_id, "rewrite")
     return jsonify({"job_id": job_id, "from_cache": True})
 
 
