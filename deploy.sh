@@ -72,6 +72,7 @@ ADMIN_1_PASS=admin-1-pass:latest,\
 ADMIN_2_EMAIL=admin-2-email:latest,\
 ADMIN_2_PASS=admin-2-pass:latest,\
 INTERNAL_TOKEN=internal-token:latest,\
+YOUTUBE_API_KEY=youtube-api-key:latest,\
 YT_PROXY=yt-proxy:latest"
 
 echo ""

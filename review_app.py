@@ -450,6 +450,70 @@ def _gemini_generate_with_retry(client, model_id: str, contents, config,
     return resp  # final attempt result, callers handle the empty case
 
 
+# ── YouTube submissions ───────────────────────────────────
+# Gemini fetches a YouTube URL server-side, so a linked film never touches this
+# container: no yt-dlp, no residential proxy to dodge YouTube's datacenter-IP
+# blocking, no GCS object, nothing in RAM-backed /tmp. Clip offsets work on a
+# YouTube URL exactly as they do on an uploaded file, so segmented viewing is
+# unchanged. The video must be public or unlisted — private videos are rejected.
+_YT_RE = re.compile(
+    r"^https?://(?:www\.|m\.)?(?:youtube\.com/(?:watch\?(?:.*&)?v=|live/|shorts/|embed/)|youtu\.be/)"
+    r"(?P<id>[A-Za-z0-9_-]{11})",
+    re.IGNORECASE,
+)
+YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "")
+
+
+def _youtube_id(url: str) -> str:
+    """Return the 11-character video id, or '' if this is not a YouTube URL."""
+    m = _YT_RE.match((url or "").strip())
+    return m.group("id") if m else ""
+
+
+def _youtube_canonical(url: str) -> str:
+    vid = _youtube_id(url)
+    return f"https://www.youtube.com/watch?v={vid}" if vid else ""
+
+
+def _iso8601_to_minutes(dur: str) -> float:
+    """'PT1H35M12S' -> minutes. YouTube reports durations in ISO-8601."""
+    m = re.match(r"^P(?:(\d+)D)?T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$", dur or "")
+    if not m:
+        return 0.0
+    d, h, mi, s = (int(x) if x else 0 for x in m.groups())
+    return (d * 1440) + (h * 60) + mi + (s / 60)
+
+
+def _youtube_meta(url: str) -> dict:
+    """Title and runtime for a YouTube video, via the YouTube Data API.
+
+    Runtime matters because segmented viewing splits on it; without a download
+    there is nothing local to probe with ffprobe. Returns {} when unavailable,
+    and callers fall back to a single-window analysis.
+    """
+    vid = _youtube_id(url)
+    if not vid or not YOUTUBE_API_KEY:
+        return {}
+    try:
+        import urllib.request, urllib.parse
+        q = urllib.parse.urlencode({"part": "contentDetails,snippet", "id": vid,
+                                     "key": YOUTUBE_API_KEY})
+        with urllib.request.urlopen(
+                f"https://www.googleapis.com/youtube/v3/videos?{q}", timeout=15) as r:
+            data = json.loads(r.read().decode())
+        items = data.get("items") or []
+        if not items:
+            return {}
+        it = items[0]
+        return {
+            "title":       it.get("snippet", {}).get("title", ""),
+            "runtime_min": _iso8601_to_minutes(it.get("contentDetails", {}).get("duration", "")),
+        }
+    except Exception as e:
+        logging.warning("[youtube] metadata lookup failed for %s: %s", vid, e)
+        return {}
+
+
 # ── Job dispatch (Cloud Tasks) ────────────────────────────
 # Processing used to run in a detached threading.Thread after the HTTP response
 # returned. Cloud Run only keeps an instance alive while a request is in flight,
@@ -581,9 +645,13 @@ def _segment_windows(runtime_min: float) -> list[tuple[float, float]]:
     return [(i * step, min((i + 1) * step, total_s)) for i in range(n)]
 
 
-def _analyse_film_in_segments(client, model_id: str, file_obj, festival: dict,
-                               meta: dict, runtime_min: float, job_id: str):
+def _analyse_film_in_segments(client, model_id: str, video_uri: str, video_mime: str | None,
+                               festival: dict, meta: dict, runtime_min: float, job_id: str):
     """Watch the film window by window, then synthesise a scored assessment.
+
+    video_uri is either a Gemini Files API uri (uploaded film, with its mime
+    type) or a public YouTube watch URL (video_mime None) — clip offsets behave
+    identically for both, so segmented viewing needs no other change.
     Returns (analysis_dict, used_low_resolution)."""
     windows   = _segment_windows(runtime_min)
     total     = len(windows)
@@ -602,7 +670,8 @@ def _analyse_film_in_segments(client, model_id: str, file_obj, festival: dict,
     def _watch(i: int) -> tuple[int, str, bool]:
         start_s, end_s = windows[i]
         part = types.Part(
-            file_data=types.FileData(file_uri=file_obj.uri, mime_type=file_obj.mime_type),
+            file_data=(types.FileData(file_uri=video_uri, mime_type=video_mime)
+                       if video_mime else types.FileData(file_uri=video_uri)),
             video_metadata=types.VideoMetadata(start_offset=f"{int(start_s)}s",
                                                 end_offset=f"{int(math.ceil(end_s))}s"),
         )
@@ -791,7 +860,60 @@ def process_video(job_id: str, video_path: str, meta: dict):
         password          = meta.get("screener_password", "")
         gcs_upload_blob   = meta.get("gcs_blob", "")
 
-        # ── 0. Acquire video ──────────────────────────────────────────────
+        # ── 0a. YouTube submission — nothing to acquire ────────────────────
+        # Gemini streams the video itself, so we skip download, Files API upload
+        # and the processing poll entirely, and go straight to analysis.
+        yt_url = _youtube_canonical(meta.get("youtube_url", ""))
+        if yt_url:
+            db.job_update(job_id, {"status": "processing", "progress": 30,
+                                    "message": "Fetching the film from YouTube…"})
+            yt = _youtube_meta(yt_url)
+            duration_min = float(yt.get("runtime_min") or 0)
+            if duration_min > DIRECT_UPLOAD_MAX_MIN:
+                raise RuntimeError(
+                    f"Film is {round(duration_min)} minutes long. "
+                    f"Only films up to {DIRECT_UPLOAD_MAX_MIN} minutes are accepted.")
+            if duration_min <= 0:
+                # No runtime available: analyse as a single window rather than
+                # guessing a segmentation that would misreport timestamps.
+                logging.warning("[youtube] no duration for %s — single-window analysis", yt_url)
+            runtime_str = f"{round(duration_min)} min" if duration_min else ""
+            meta = {**meta, "runtime": runtime_str, "runtime_min": duration_min}
+            db.film_update_meta(film_id, {"runtime": runtime_str, "runtime_min": duration_min,
+                                           "screener_url": yt_url})
+
+            db.job_update(job_id, {"status": "analysing", "progress": 65,
+                                    "message": "Scoring story, direction & craft…"})
+            analysis, used_low_res = _analyse_film_in_segments(
+                client, model_id, yt_url, None, festival, meta, duration_min, job_id)
+            if used_low_res:
+                analysis["quality_warning"] = (
+                    "This film exceeded Gemini's analysis context window at full detail, so it was "
+                    "re-analysed at reduced video resolution. Scores and notes are still based on a "
+                    "full viewing, but fine visual/audio detail may be less precise than usual.")
+
+            db.job_update(job_id, {"status": "scoring", "progress": 75,
+                                    "message": "Compiling scores and notes…"})
+            db.film_save_analysis(film_id, analysis)
+            db.film_update_meta(film_id, meta)
+
+            db.job_update(job_id, {"status": "writing", "progress": 82,
+                                    "message": "Drafting the Expert Review…"})
+            review = _write_review(client, meta, analysis, festival)
+
+            db.job_update(job_id, {"status": "finalising", "progress": 94,
+                                    "message": "Saving review and formatting…"})
+            db.review_upsert(film_id, meta.get("festival_key", DEFAULT_FESTIVAL), review,
+                             season=meta.get("season", ""),
+                             overall_rating=_extract_overall_rating(review))
+            db.job_update(job_id, {
+                "status": "done", "progress": 100, "message": "Review ready",
+                "analysis": analysis, "review": review, "film_id": film_id,
+                "completed_at": datetime.now(timezone.utc),
+            })
+            return
+
+        # ── 0b. Acquire video ─────────────────────────────────────────────
         if gcs_upload_blob:
             # Browser uploaded directly to GCS — pull it down to a local temp file
             db.job_update(job_id, {"status": "downloading", "progress": 10,
@@ -887,7 +1009,7 @@ def process_video(job_id: str, video_path: str, meta: dict):
         db.job_update(job_id, {"status": "analysing", "progress": 65,
                                 "message": "Scoring story, direction & craft…"})
         analysis, used_low_res = _analyse_film_in_segments(
-            client, model_id, f, festival, meta, duration_min, job_id)
+            client, model_id, f.uri, f.mime_type, festival, meta, duration_min, job_id)
         if used_low_res:
             analysis["quality_warning"] = (
                 "This film exceeded Gemini's analysis context window at full detail, so it was "
@@ -1270,6 +1392,13 @@ def upload():
 
     gcs_blob = _sanitise(request.form.get("gcs_blob", ""), 256)
     has_file = "video" in request.files and request.files["video"].filename
+    # A film may arrive as an upload or as a YouTube link; the link needs no
+    # file at all because Gemini fetches it directly.
+    yt_raw   = _sanitise(request.form.get("youtube_url", ""), 256)
+    yt_url   = _youtube_canonical(yt_raw)
+    if yt_raw and not yt_url:
+        return jsonify({"error": "That does not look like a YouTube link. "
+                                 "Use a youtube.com/watch or youtu.be URL."}), 400
     # Note: file is required ONLY if no cached analysis exists (checked after dedup below)
 
     # ── Festival access control ───────────────────────────
@@ -1408,12 +1537,15 @@ def upload():
         return jsonify({"job_id": job_id, "from_cache": True})
 
     # ── No dedup hit → a video is required ────────────────
-    if not gcs_blob and not has_file:
-        return jsonify({"error": "Please upload a video file to continue"}), 400
+    if not gcs_blob and not has_file and not yt_url:
+        return jsonify({"error": "Please upload a video file or paste a YouTube link"}), 400
 
     # ── Resolve video source ──────────────────────────────
     # Large files arrive via GCS (gcs_blob); small ones may still POST directly.
-    if gcs_blob:
+    # A YouTube link needs neither — Gemini fetches it, so there is nothing to store.
+    if yt_url:
+        video_path = ""
+    elif gcs_blob:
         if not gcs_blob.startswith("uploads/"):
             return jsonify({"error": "Invalid upload reference"}), 400
         video_path = ""          # process_video will pull it from GCS
@@ -1458,9 +1590,10 @@ def upload():
         "director_statement": dir_stmt,
         "genre":              genre,
         "synopsis":           synopsis,
-        "screener_url":       "",
+        "screener_url":       yt_url,
         "screener_password":  "",
         "gcs_blob":           gcs_blob,
+        "youtube_url":        yt_url,
         "festival_key":       festival_key,
         "festival_name":      festival["name"],
         "season":             season,
@@ -4044,13 +4177,31 @@ APP_BODY = """<div class="main">
         <div class="card-head-title">Video Source</div>
       </div>
       <div class="card-body">
-        <!-- File upload only -->
+        <!-- Upload a file, or link a YouTube video (Gemini streams it directly) -->
         <div class="drop-zone" id="dropZone">
           <div class="drop-icon" id="dropIcon">🎞</div>
           <div class="drop-title" id="dropTitle">Drop video file here</div>
           <div class="drop-sub" id="dropSub">or click to browse — MP4, MOV, AVI, WebM, MKV</div>
           <div class="file-info" id="fileInfo"></div>
           <input type="file" id="fileInput" accept=".mp4,.mov,.avi,.webm,.mkv,.mpeg">
+        </div>
+
+        <div id="ytBlock" style="margin-top:16px">
+          <div style="display:flex;align-items:center;gap:12px;margin-bottom:10px">
+            <div style="flex:1;height:1px;background:var(--border)"></div>
+            <span style="font-size:11px;font-family:'DM Mono',monospace;color:var(--muted);letter-spacing:.08em">OR</span>
+            <div style="flex:1;height:1px;background:var(--border)"></div>
+          </div>
+          <label style="display:block;font-size:12px;color:var(--muted);margin-bottom:6px">
+            YouTube link <span class="optional-tag">no upload needed</span>
+          </label>
+          <input type="url" id="youtubeUrl" placeholder="https://www.youtube.com/watch?v=..."
+                 oninput="updateSourceMode()"
+                 style="width:100%;background:var(--bg3);border:1px solid rgba(255,255,255,.08);
+                        border-radius:8px;color:var(--text);padding:10px 14px;font-size:13px">
+          <div id="ytHint" style="font-size:11px;color:var(--muted);margin-top:6px;line-height:1.5">
+            The video must be <strong>public or unlisted</strong> — private videos cannot be read.
+          </div>
         </div>
 
         <div class="error-msg" id="errorMsg"></div>
@@ -4243,7 +4394,38 @@ function updateUploadMode() {
   fi.value = '';
   document.getElementById('fileInfo').textContent = '';
   dropZone.classList.remove('has-file');
-  document.getElementById('submitBtn').disabled = true;
+  // A YouTube link only makes sense for films, never for written submissions
+  const ytBlock = document.getElementById('ytBlock');
+  if (ytBlock) {
+    ytBlock.style.display = script ? 'none' : '';
+    if (script) document.getElementById('youtubeUrl').value = '';
+  }
+  updateSourceMode();
+}
+
+const YT_RE = /^https?:\/\/(?:www\.|m\.)?(?:youtube\.com\/(?:watch\?(?:.*&)?v=|live\/|shorts\/|embed\/)|youtu\.be\/)([A-Za-z0-9_-]{11})/i;
+function youtubeUrlValue() {
+  const el = document.getElementById('youtubeUrl');
+  return el && el.offsetParent !== null ? (el.value || '').trim() : '';
+}
+
+// Either source satisfies the form: a picked file OR a valid YouTube link.
+function updateSourceMode() {
+  const yt = youtubeUrlValue();
+  const ytValid = !!yt && YT_RE.test(yt);
+  const hint = document.getElementById('ytHint');
+  if (hint && yt) {
+    hint.textContent = ytValid
+      ? 'Looks good — the film will be read straight from YouTube, no upload needed.'
+      : 'That does not look like a YouTube link (youtube.com/watch or youtu.be).';
+    hint.style.color = ytValid ? 'var(--green)' : 'var(--red, #e5534b)';
+  } else if (hint) {
+    hint.innerHTML = 'The video must be <strong>public or unlisted</strong> — private videos cannot be read.';
+    hint.style.color = 'var(--muted)';
+  }
+  // Pasting a link supersedes a picked file, and vice versa
+  if (dropZone) dropZone.style.opacity = ytValid ? '.45' : '1';
+  document.getElementById('submitBtn').disabled = !(selectedFile || ytValid);
 }
 
 // no separate listener needed — oninput="_updateSubmitBtn()" is inline on the input
@@ -4375,7 +4557,34 @@ async function submitReview() {
   }
 
   showProcessing();
+  const ytLink = youtubeUrlValue();
   try {
+    // ── YouTube link: no upload at all. Gemini reads the video directly, so
+    // we skip the dedup pre-check's upload shortcut and the GCS round trip. ──
+    if (ytLink && YT_RE.test(ytLink)) {
+      setProgressMsg('Sending the YouTube link for analysis…', 8);
+      const form = new FormData();
+      form.append('youtube_url',        ytLink);
+      form.append('festival_key',       document.getElementById('festivalKey').value);
+      form.append('title',              title);
+      form.append('director',           director);
+      form.append('logline',            document.getElementById('logline').value);
+      form.append('director_statement', document.getElementById('director_statement').value);
+      form.append('genre',              genre);
+      form.append('season',             document.getElementById('season').value);
+      form.append('synopsis',           document.getElementById('synopsis').value);
+      const res = await fetch('/upload', { method:'POST', body:form });
+      if (!res.ok) {
+        let m = `Server error (HTTP ${res.status})`;
+        try { const j = await res.json(); if (j.error) m = j.error; } catch(_) {}
+        showFormError(m); return;
+      }
+      const data = await res.json();
+      if (data.error) { showFormError(data.error); return; }
+      pollStatus(data.job_id);
+      return;
+    }
+
     // ── Step 0: dedup pre-check — skip the upload entirely if this film
     // (title + director) was already analysed within this festival. ──
     setProgressMsg('Checking for an existing analysis of this film…', 4);
