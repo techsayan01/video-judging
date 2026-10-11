@@ -1387,8 +1387,8 @@ def upload():
 
     if not title or not director:
         return jsonify({"error": "Title and director are required"}), 400
-    if not genre:
-        return jsonify({"error": "Genre / Category is required"}), 400
+    # Category is optional (the upload form no longer asks for it); a script is
+    # recognised by the attached document instead.
 
     gcs_blob = _sanitise(request.form.get("gcs_blob", ""), 256)
     has_file = "video" in request.files and request.files["video"].filename
@@ -1419,8 +1419,8 @@ def upload():
         return jsonify({"error": f"No Gemini API key configured for {festival['name']}"}), 400
 
     # ── Script / written-work categories: document path ───
-    if _is_script_category(genre):
-        has_doc = "document" in request.files and request.files["document"].filename
+    has_doc = "document" in request.files and request.files["document"].filename
+    if has_doc or _is_script_category(genre):
         # Dedup: reuse cached analysis if this written work was already judged
         # within this festival (dedup is scoped per-festival, not global)
         existing = db.film_find_by_identity(title, director, festival_key=festival_key)
@@ -4143,12 +4143,6 @@ APP_BODY = """<div class="main">
             <input type="text" id="director" placeholder="Jane Smith" required>
           </div>
           <div class="form-group">
-            <label>Category *</label>
-            <select id="genre" required onchange="updateUploadMode()">
-              <option value="" disabled selected>— select a category —</option>
-            </select>
-          </div>
-          <div class="form-group">
             <label>Season <span class="optional-tag">optional</span></label>
             <select id="season">
               <option value="" selected>— select a season —</option>
@@ -4180,10 +4174,10 @@ APP_BODY = """<div class="main">
         <!-- Upload a file, or link a YouTube video (Gemini streams it directly) -->
         <div class="drop-zone" id="dropZone">
           <div class="drop-icon" id="dropIcon">🎞</div>
-          <div class="drop-title" id="dropTitle">Drop video file here</div>
-          <div class="drop-sub" id="dropSub">or click to browse — MP4, MOV, AVI, WebM, MKV</div>
+          <div class="drop-title" id="dropTitle">Drop a video or script here</div>
+          <div class="drop-sub" id="dropSub">or click to browse — MP4, MOV, AVI, WebM, MKV · scripts: PDF, DOC, DOCX, TXT</div>
           <div class="file-info" id="fileInfo"></div>
-          <input type="file" id="fileInput" accept=".mp4,.mov,.avi,.webm,.mkv,.mpeg">
+          <input type="file" id="fileInput" accept=".mp4,.mov,.avi,.webm,.mkv,.mpeg,.pdf,.doc,.docx,.txt">
         </div>
 
         <div id="ytBlock" style="margin-top:16px">
@@ -4302,23 +4296,6 @@ const FESTIVALS = {
   {% endfor %}
 };
 
-const CATEGORIES_MAP = {{ categories_map | tojson }};
-
-function populateCategories(festivalKey) {
-  const sel = document.getElementById('genre');
-  const cats = CATEGORIES_MAP[festivalKey] || [];
-  sel.innerHTML = '';
-  const placeholder = document.createElement('option');
-  placeholder.value = ''; placeholder.disabled = true; placeholder.selected = true;
-  placeholder.textContent = cats.length ? '— select a category —' : '— no categories configured —';
-  sel.appendChild(placeholder);
-  cats.forEach(c => {
-    const opt = document.createElement('option');
-    opt.value = c; opt.textContent = c;
-    sel.appendChild(opt);
-  });
-}
-
 function populateSeasons(festivalKey) {
   const sel = document.getElementById('season');
   sel.innerHTML = '<option value="" disabled selected>Loading…</option>';
@@ -4347,7 +4324,6 @@ function onFestivalChange(sel) {
   const f = FESTIVALS[sel.value];
   document.getElementById('festivalHint').textContent =
     f ? `${f.words}-word review · ${f.focus}` : '';
-  populateCategories(sel.value);
   populateSeasons(sel.value);
   document.getElementById('formCard').style.display   = 'block';
   document.getElementById('uploadCard').style.display = 'block';
@@ -4357,7 +4333,6 @@ function onFestivalChange(sel) {
 (function() {
   const userRole = "{{ user_role }}";
   if (userRole !== 'admin') {
-    populateCategories("{{ user_festival }}");
     populateSeasons("{{ user_festival }}");
     document.getElementById('formCard').style.display   = 'block';
     document.getElementById('uploadCard').style.display = 'block';
@@ -4367,7 +4342,6 @@ function onFestivalChange(sel) {
 function clearFilmFields() {
   ['title','director','logline','director_statement'].forEach(id =>
     document.getElementById(id).value = '');
-  document.getElementById('genre').value    = '';
   document.getElementById('synopsis').value = '';
 }
 
@@ -4375,32 +4349,10 @@ function _updateSubmitBtn() {
   updateSourceMode();
 }
 
-// ── Script / written-work category detection & upload-mode toggle ──
-const SCRIPT_RE = /\b(script|screenplay|stageplay|teleplay|poem|novel|radio script)\b/i;
-function isScriptCategory() {
-  return SCRIPT_RE.test(document.getElementById('genre').value || '');
-}
-function updateUploadMode() {
-  const script = isScriptCategory();
-  const fi = document.getElementById('fileInput');
-  document.getElementById('dropIcon').textContent  = script ? '📄' : '🎞';
-  document.getElementById('dropTitle').textContent = script ? 'Drop your script here' : 'Drop video file here';
-  document.getElementById('dropSub').textContent   = script
-    ? 'or click to browse — PDF, DOC, DOCX, TXT'
-    : 'or click to browse — MP4, MOV, AVI, WebM, MKV';
-  fi.setAttribute('accept', script ? '.pdf,.doc,.docx,.txt' : '.mp4,.mov,.avi,.webm,.mkv,.mpeg');
-  // Reset any previously selected file when switching modes
-  selectedFile = null;
-  fi.value = '';
-  document.getElementById('fileInfo').textContent = '';
-  dropZone.classList.remove('has-file');
-  // A YouTube link only makes sense for films, never for written submissions
-  const ytBlock = document.getElementById('ytBlock');
-  if (ytBlock) {
-    ytBlock.style.display = script ? 'none' : '';
-    if (script) document.getElementById('youtubeUrl').value = '';
-  }
-  updateSourceMode();
+// ── Script / written-work detection: by the picked file's type ──
+const DOC_FILE_RE = /\.(pdf|doc|docx|txt)$/i;
+function isScriptSubmission() {
+  return !!(selectedFile && DOC_FILE_RE.test(selectedFile.name));
 }
 
 const YT_RE = /^https?:\/\/(?:www\.|m\.)?(?:youtube\.com\/(?:watch\?(?:.*&)?v=|live\/|shorts\/|embed\/)|youtu\.be\/)([A-Za-z0-9_-]{11})/i;
@@ -4445,15 +4397,8 @@ fileInput.addEventListener('change', e => { if (e.target.files[0]) handleFile(e.
 function handleFile(file) {
   const sizeMb = (file.size/1024/1024).toFixed(1);
 
-  // Script/document categories: accept the file as-is, no video probe
-  if (isScriptCategory()) {
-    const okExt = /\.(pdf|doc|docx|txt)$/i.test(file.name);
-    if (!okExt) {
-      showError('Please upload a PDF, DOC, DOCX, or TXT file for this category.');
-      selectedFile = null; dropZone.classList.remove('has-file');
-      document.getElementById('fileInfo').textContent = ''; document.getElementById('submitBtn').disabled = true;
-      return;
-    }
+  // Scripts/documents: accept the file as-is, no video probe
+  if (DOC_FILE_RE.test(file.name)) {
     if (file.size > 25 * 1024 * 1024) {
       showError(`Document is too large (${sizeMb} MB). Maximum is 25 MB.`);
       selectedFile = null; dropZone.classList.remove('has-file');
@@ -4519,16 +4464,14 @@ async function submitReview() {
   if (!festivalKey) { showError('Please select a festival before submitting'); return; }
   const title    = document.getElementById('title').value.trim();
   const director = document.getElementById('director').value.trim();
-  const genre    = document.getElementById('genre').value.trim();
   if (!title || !director) { showError('Film title and director are required'); return; }
-  if (!genre)              { showError('Genre / Category is required'); return; }
 
-  // A film may come from a picked file OR a valid YouTube link; scripts need a file.
-  const ytOk = !isScriptCategory() && YT_RE.test(youtubeUrlValue());
-  if (!selectedFile && !ytOk) { showError(isScriptCategory() ? 'Please upload your script (PDF, DOC, DOCX, or TXT)' : 'Please upload a video file or paste a YouTube link'); return; }
+  // A film may come from a picked file OR a valid YouTube link.
+  const ytOk = YT_RE.test(youtubeUrlValue());
+  if (!selectedFile && !ytOk) { showError('Please upload a video or script file, or paste a YouTube link'); return; }
 
-  // ── Script/document categories: small file → POST directly to /upload ──
-  if (isScriptCategory()) {
+  // ── Scripts/documents: small file → POST directly to /upload ──
+  if (isScriptSubmission()) {
     showProcessing();
     setProgressMsg('Uploading your script…', 10);
     try {
@@ -4539,7 +4482,6 @@ async function submitReview() {
       form.append('director',           director);
       form.append('logline',            document.getElementById('logline').value);
       form.append('director_statement', document.getElementById('director_statement').value);
-      form.append('genre',              genre);
       form.append('season',             document.getElementById('season').value);
       form.append('synopsis',           document.getElementById('synopsis').value);
       const res = await fetch('/upload', { method:'POST', body:form });
@@ -4572,7 +4514,6 @@ async function submitReview() {
       form.append('director',           director);
       form.append('logline',            document.getElementById('logline').value);
       form.append('director_statement', document.getElementById('director_statement').value);
-      form.append('genre',              genre);
       form.append('season',             document.getElementById('season').value);
       form.append('synopsis',           document.getElementById('synopsis').value);
       const res = await fetch('/upload', { method:'POST', body:form });
@@ -4630,7 +4571,6 @@ async function submitReview() {
     form.append('director',           director);
     form.append('logline',            document.getElementById('logline').value);
     form.append('director_statement', document.getElementById('director_statement').value);
-    form.append('genre',              genre);
     form.append('season',             document.getElementById('season').value);
     form.append('synopsis',           document.getElementById('synopsis').value);
 
