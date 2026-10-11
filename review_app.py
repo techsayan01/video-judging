@@ -4358,7 +4358,7 @@ function isScriptSubmission() {
 const YT_RE = /^https?:\/\/(?:www\.|m\.)?(?:youtube\.com\/(?:watch\?(?:.*&)?v=|live\/|shorts\/|embed\/)|youtu\.be\/)([A-Za-z0-9_-]{11})/i;
 function youtubeUrlValue() {
   const el = document.getElementById('youtubeUrl');
-  return el && el.offsetParent !== null ? (el.value || '').trim() : '';
+  return el ? (el.value || '').trim() : '';
 }
 
 // Either source satisfies the form: a picked file OR a valid YouTube link.
@@ -4466,8 +4466,10 @@ async function submitReview() {
   const director = document.getElementById('director').value.trim();
   if (!title || !director) { showError('Film title and director are required'); return; }
 
-  // A film may come from a picked file OR a valid YouTube link.
-  const ytOk = YT_RE.test(youtubeUrlValue());
+  // A film may come from a picked file OR a valid YouTube link. Read the link
+  // now: showProcessing() below hides the form.
+  const ytLink = youtubeUrlValue();
+  const ytOk   = YT_RE.test(ytLink);
   if (!selectedFile && !ytOk) { showError('Please upload a video or script file, or paste a YouTube link'); return; }
 
   // ── Scripts/documents: small file → POST directly to /upload ──
@@ -4501,11 +4503,10 @@ async function submitReview() {
   }
 
   showProcessing();
-  const ytLink = youtubeUrlValue();
   try {
     // ── YouTube link: no upload at all. Gemini reads the video directly, so
     // we skip the dedup pre-check's upload shortcut and the GCS round trip. ──
-    if (ytLink && YT_RE.test(ytLink)) {
+    if (ytOk) {
       setProgressMsg('Sending the YouTube link for analysis…', 8);
       const form = new FormData();
       form.append('youtube_url',        ytLink);
