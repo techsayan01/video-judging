@@ -410,6 +410,9 @@ def _friendly_error(e: Exception) -> str:
         return ("This film is too long for Gemini to analyse in one pass (exceeds its 1M-token "
                 "context window). This can happen with long feature-length films even under our "
                 "120-minute limit. Please contact an admin to have it processed in chunks.")
+    if "only films up to" in low:
+        # Our own runtime-limit message: written for the user, safe to show as-is.
+        return msg
     # Unrecognised error: don't leak internal details to the client. Log the full
     # exception server-side and hand the user a correlation id to quote in support.
     ref = uuid.uuid4().hex[:8]
