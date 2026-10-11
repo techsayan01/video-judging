@@ -17,8 +17,9 @@ GEMINI_MODEL_PRO = "gemini-1.5-pro"
 
 # ── Film length thresholds ────────────────────────────────────────────────────
 DIRECT_UPLOAD_MAX_MIN = 120    # ≤ 120 min → direct Gemini Files API upload
-YOUTUBE_MAX_MIN       = 240    # YouTube links: no file-size limit, so longer films
-                               # are watched in 120-min batches with a shared recap
+FILM_MAX_MIN          = 240    # YouTube links and browser uploads: longer films are
+                               # watched in 120-min batches with a shared recap
+GEMINI_FILE_MAX_MB    = 1900   # Gemini Files API takes up to 2 GB per file
 FEATURE_MIN           = 120    # > 120 min → GCS gs:// URI (or chunked keyframes fallback)
 LONG_FILM_FRAME_FPS   = "1/10" # 1 keyframe every 10s for chunked fallback
 CHUNK_FRAMES          = 80     # max frames per Gemini call in chunked mode

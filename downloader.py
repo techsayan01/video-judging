@@ -79,7 +79,8 @@ def delete_from_gcs(bucket: str, blob_name: str):
         gcs_lib.Client().bucket(bucket).blob(blob_name).delete()
         print(f"  [gcs] Deleted gs://{bucket}/{blob_name}")
     except Exception as e:
-        print(f"  [gcs] Delete failed (non-fatal): {e}")
+        # Non-fatal: the upload bucket's lifecycle rule deletes leftovers after 1 day.
+        print(f"  [gcs] Delete failed (non-fatal, bucket lifecycle will expire it): {e}")
 
 
 def generate_upload_url(bucket: str, blob_name: str, content_type: str = "video/mp4",
@@ -118,6 +119,49 @@ def upload_to_gcs(local_path: str, bucket: str, blob_name: str,
     blob.upload_from_filename(local_path, content_type=content_type)
     print(f"  [gcs] Uploaded {local_path} -> gs://{bucket}/{blob_name}")
     return blob_name
+
+
+VIDEO_MIME = {".mp4": "video/mp4", ".mov": "video/quicktime", ".avi": "video/x-msvideo",
+              ".webm": "video/webm", ".mkv": "video/x-matroska", ".mpeg": "video/mpeg"}
+
+
+def _gcs_token(creds=None) -> str:
+    import google.auth
+    from google.auth.transport import requests as gauth_requests
+    if creds is None:
+        creds, _ = google.auth.default()
+    if not creds.valid:
+        creds.refresh(gauth_requests.Request())
+    return creds.token
+
+
+def probe_gcs_video(bucket: str, blob_name: str, storage_client=None, creds=None) -> dict:
+    """Size and runtime of a video in GCS, without downloading it. ffprobe reads
+    only the byte ranges it needs over authenticated HTTPS."""
+    from urllib.parse import quote
+    from google.cloud import storage as gcs_lib
+    blob = (storage_client or gcs_lib.Client()).bucket(bucket).get_blob(blob_name)
+    if blob is None:
+        return {"success": False, "error": "Uploaded file not found in storage"}
+    url = f"https://storage.googleapis.com/{bucket}/{quote(blob_name)}"
+    cmd = ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format",
+           "-headers", f"Authorization: Bearer {_gcs_token(creds)}\r\n", url]
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        duration_min = float(json.loads(out.stdout)["format"]["duration"]) / 60
+    except Exception:
+        duration_min = 0.0
+    return {"success": True, "size_mb": blob.size / (1024 * 1024),
+            "duration_min": duration_min,
+            "mime_type": VIDEO_MIME.get(Path(blob_name).suffix.lower(), "video/mp4")}
+
+
+def open_gcs_stream(bucket: str, blob_name: str, storage_client=None):
+    """Seekable read stream over a GCS object, for handing a video straight to
+    Gemini without staging it on this server's (in-memory) disk."""
+    from google.cloud import storage as gcs_lib
+    blob = (storage_client or gcs_lib.Client()).bucket(bucket).blob(blob_name)
+    return blob.open("rb", chunk_size=16 * 1024 * 1024)
 
 
 def download_from_gcs(bucket: str, blob_name: str, dest_path: str) -> dict:

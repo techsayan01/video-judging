@@ -101,7 +101,7 @@ limiter = Limiter(
 )
 
 # ── Config ────────────────────────────────────────────────
-MAX_UPLOAD_MB  = 4000   # 4 GB — feature films can be 2–3 GB
+MAX_UPLOAD_MB  = 1900   # Gemini Files API takes up to 2 GB per file
 ALLOWED_EXT    = {".mp4", ".mov", ".avi", ".webm", ".mkv", ".mpeg"}
 # Script / written-work categories accept documents instead of video
 DOC_EXT        = {".pdf", ".doc", ".docx", ".txt"}
@@ -395,16 +395,21 @@ def _visible_festival_keys() -> list[str]:
 
 
 # ── Helpers ───────────────────────────────────────────────
-class YouTubeAccessError(RuntimeError):
+class UserFacingError(RuntimeError):
+    """A failure whose message is written for the submitter (what to do next),
+    so it is shown as-is instead of being masked behind an error ref."""
+
+
+class YouTubeAccessError(UserFacingError):
     """Gemini refused to read a YouTube link (403) — almost always because the
-    video is unlisted or private. Its message is written for the user."""
+    video is unlisted or private."""
 
 
 def _friendly_error(e: Exception) -> str:
     """Turn a raw exception into an actionable message. In particular, detect
     invalid/expired/revoked Gemini API keys, which otherwise surface as an
     opaque 400/401/403 from the SDK and get mistaken for content-safety blocks."""
-    if isinstance(e, YouTubeAccessError):
+    if isinstance(e, UserFacingError):
         return str(e)
     msg = str(e)
     low = msg.lower()
@@ -418,9 +423,6 @@ def _friendly_error(e: Exception) -> str:
         return ("This film is too long for Gemini to analyse in one pass (exceeds its 1M-token "
                 "context window). This can happen with long feature-length films even under our "
                 "120-minute limit. Please contact an admin to have it processed in chunks.")
-    if "only films up to" in low:
-        # Our own runtime-limit message: written for the user, safe to show as-is.
-        return msg
     # Unrecognised error: don't leak internal details to the client. Log the full
     # exception server-side and hand the user a correlation id to quote in support.
     ref = uuid.uuid4().hex[:8]
@@ -899,7 +901,7 @@ def process_video(job_id: str, video_path: str, meta: dict):
                                 "message": "Waiting for a processing slot (server is busy)…"})
         _processing_sem.acquire()  # now block for real
     from downloader import get_video_duration, stream_to_gcs, delete_from_gcs, extract_keyframes
-    from config import DIRECT_UPLOAD_MAX_MIN, YOUTUBE_MAX_MIN, CHUNK_FRAMES
+    from config import DIRECT_UPLOAD_MAX_MIN, FILM_MAX_MIN, GEMINI_FILE_MAX_MB, CHUNK_FRAMES
 
     GCS_BUCKET = os.getenv("GCS_BUCKET", "")
 
@@ -929,10 +931,10 @@ def process_video(job_id: str, video_path: str, meta: dict):
                                     "message": "Fetching the film from YouTube…"})
             yt = _youtube_meta(yt_url)
             duration_min = float(yt.get("runtime_min") or 0)
-            if duration_min > YOUTUBE_MAX_MIN:
-                raise RuntimeError(
+            if duration_min > FILM_MAX_MIN:
+                raise UserFacingError(
                     f"Film is {round(duration_min)} minutes long. "
-                    f"Only films up to {YOUTUBE_MAX_MIN} minutes are accepted.")
+                    f"Only films up to {FILM_MAX_MIN} minutes are accepted.")
             if duration_min <= 0:
                 # No runtime available: analyse as a single window rather than
                 # guessing a segmentation that would misreport timestamps.
@@ -952,10 +954,10 @@ def process_video(job_id: str, video_path: str, meta: dict):
                 # refusing this video, which it does for unlisted/private links.
                 if "permission_denied" in str(e).lower():
                     raise YouTubeAccessError(
-                        "Gemini couldn't open this YouTube video. Set its visibility to "
-                        "Public — unlisted and private videos can't be read — or upload "
-                        "the film file instead. If the video is already public, ask an "
-                        "admin to check this festival's Gemini API key.") from e
+                        "This YouTube video is not public, so it can't be read from the "
+                        "link (unlisted and private videos are blocked). Download the "
+                        "video and upload the file here instead — or set the video to "
+                        "Public on YouTube and resubmit the link.") from e
                 raise
             if used_low_res:
                 analysis["quality_warning"] = (
@@ -985,18 +987,33 @@ def process_video(job_id: str, video_path: str, meta: dict):
             return
 
         # ── 0b. Acquire video ─────────────────────────────────────────────
+        gemini_file = None
         if gcs_upload_blob:
-            # Browser uploaded directly to GCS — pull it down to a local temp file
+            # Browser uploaded directly to GCS. Stream it from there to Gemini:
+            # Cloud Run's /tmp is RAM, so staging a feature film on this server
+            # would cost gigabytes of memory per job. The film never lands here.
             db.job_update(job_id, {"status": "downloading", "progress": 10,
-                                    "message": "Retrieving uploaded video…"})
-            from downloader import download_from_gcs
+                                    "message": "Checking the uploaded video…"})
+            from downloader import probe_gcs_video, open_gcs_stream
             bucket = os.getenv("GCS_UPLOAD_BUCKET", "")
-            tmp_dl = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False).name
-            dl = download_from_gcs(bucket, gcs_upload_blob, tmp_dl)
-            if not dl["success"]:
-                raise RuntimeError(dl.get("error", "Could not retrieve uploaded video"))
-            video_path   = dl["path"]
-            duration_min = dl["duration_min"]
+            probe  = probe_gcs_video(bucket, gcs_upload_blob)
+            if not probe["success"]:
+                raise RuntimeError(probe.get("error", "Could not retrieve uploaded video"))
+            duration_min = probe["duration_min"]
+            if duration_min > FILM_MAX_MIN:
+                raise UserFacingError(
+                    f"Film is {round(duration_min)} minutes long. "
+                    f"Only films up to {FILM_MAX_MIN} minutes are accepted.")
+            if probe["size_mb"] > GEMINI_FILE_MAX_MB:
+                raise UserFacingError(
+                    f"Video file is {probe['size_mb'] / 1024:.1f} GB. Only files up to 2 GB "
+                    f"are accepted. Please re-export at 720p or a lower bitrate and upload again.")
+            db.job_update(job_id, {"status": "uploading", "progress": 18,
+                                    "message": f"Sending the {round(duration_min)}-min film to Gemini…"})
+            with open_gcs_stream(bucket, gcs_upload_blob) as stream:
+                gemini_file = client.files.upload(
+                    file=stream, config={"mime_type": probe["mime_type"]})
+            uploaded_files.append(gemini_file)
         elif not video_path:
             db.job_update(job_id, {"status": "downloading", "progress": 8,
                                     "message": "Fetching video from Vimeo — large files can take 3–8 min…"})
@@ -1029,8 +1046,10 @@ def process_video(job_id: str, video_path: str, meta: dict):
         else:
             duration_min = get_video_duration(video_path)
 
-        if duration_min > DIRECT_UPLOAD_MAX_MIN:
-            raise RuntimeError(
+        # Screener-link downloads are staged on this server, so they keep the
+        # tighter limit; browser uploads were checked above.
+        if gemini_file is None and duration_min > DIRECT_UPLOAD_MAX_MIN:
+            raise UserFacingError(
                 f"Film is {round(duration_min)} minutes long. "
                 f"Only films up to {DIRECT_UPLOAD_MAX_MIN} minutes are accepted."
             )
@@ -1046,9 +1065,12 @@ def process_video(job_id: str, video_path: str, meta: dict):
             if heavy else
             f"Uploading to Gemini [{festival['name']}]…"
         )
-        db.job_update(job_id, {"status": "uploading", "progress": 18, "message": upload_msg})
-        f = client.files.upload(file=video_path)
-        uploaded_files.append(f)
+        if gemini_file is None:
+            db.job_update(job_id, {"status": "uploading", "progress": 18, "message": upload_msg})
+            f = client.files.upload(file=video_path)
+            uploaded_files.append(f)
+        else:
+            f = gemini_file
 
         # ── 2. Gemini processes the video (can take 1–5 min for feature films) ──
         db.job_update(job_id, {"status": "processing", "progress": 32,
@@ -4265,7 +4287,7 @@ APP_BODY = """<div class="main">
                  style="width:100%;background:var(--bg3);border:1px solid rgba(255,255,255,.08);
                         border-radius:8px;color:var(--text);padding:10px 14px;font-size:13px">
           <div id="ytHint" style="font-size:11px;color:var(--muted);margin-top:6px;line-height:1.5">
-            The video must be <strong>public</strong> — unlisted and private videos cannot be read.
+            The video must be <strong>public</strong>. If it is unlisted or private, download it and upload the file above instead.
           </div>
         </div>
 
@@ -4443,7 +4465,7 @@ function updateSourceMode() {
       : 'That does not look like a YouTube link (youtube.com/watch or youtu.be).';
     hint.style.color = ytValid ? 'var(--green)' : 'var(--red, #e5534b)';
   } else if (hint) {
-    hint.innerHTML = 'The video must be <strong>public</strong> — unlisted and private videos cannot be read.';
+    hint.innerHTML = 'The video must be <strong>public</strong>. If it is unlisted or private, download it and upload the file above instead.';
     hint.style.color = 'var(--muted)';
   }
   // Pasting a link supersedes a picked file, and vice versa
@@ -4484,9 +4506,9 @@ function handleFile(file) {
     return;
   }
 
-  const MAX_MB = 4000;
+  const MAX_MB = 1900;  // Gemini accepts video files up to 2 GB
   if (file.size > MAX_MB * 1024 * 1024) {
-    showError(`File is too large (${sizeMb} MB). Maximum allowed size is ${MAX_MB} MB. Please compress the video or export at a lower bitrate.`);
+    showError(`File is too large (${(file.size/1024/1024/1024).toFixed(1)} GB). Maximum is 2 GB — please re-export at 720p or a lower bitrate.`);
     selectedFile = null;
     dropZone.classList.remove('has-file');
     document.getElementById('fileInfo').textContent = '';
@@ -4505,8 +4527,8 @@ function handleFile(file) {
   probe.onloadedmetadata = () => {
     URL.revokeObjectURL(objUrl);
     const mins = probe.duration / 60;
-    if (mins > 120) {
-      showError(`This video is ${Math.round(mins)} minutes long. Only films up to 120 minutes are accepted.`);
+    if (mins > 240) {
+      showError(`This video is ${Math.round(mins)} minutes long. Only films up to 240 minutes are accepted.`);
       selectedFile = null;
       dropZone.classList.remove('has-file');
       document.getElementById('fileInfo').textContent = '';
