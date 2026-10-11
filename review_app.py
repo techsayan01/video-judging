@@ -33,7 +33,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 
 from festivals import FESTIVALS as SEED_FESTIVALS, DEFAULT_FESTIVAL, get_festival, DOMAIN_FESTIVAL_MAP
 from prompts import (build_analysis_prompt, build_review_prompt, _cap_words,
-                     build_segment_analysis_prompt, build_synthesis_prompt)
+                     build_segment_analysis_prompt, build_synthesis_prompt,
+                     build_memory_prompt)
 import db
 import wordpress
 
@@ -631,21 +632,62 @@ def _run_job(job_id: str) -> None:
 # so the reasoning is real), then synthesise the scores from the full set of
 # notes — which is how a juror actually watches a feature.
 _SEGMENT_TARGET_MIN  = 10    # aim for ~10-minute viewing windows
-_SEGMENT_MAX         = 12    # cap windows so a 2-hour film stays bounded
+_SEGMENT_MAX         = 12    # cap windows per batch so each batch stays bounded
 _SEGMENT_WORKERS     = 3     # concurrent segment calls (API calls are I/O bound)
 _SEGMENT_THINKING    = 4096  # thinking budget per segment — depth lives here
 _SEGMENT_MAX_OUTPUT  = 4096
+# Films longer than one batch are watched batch by batch. Windows inside a batch
+# run in parallel as before; between batches the notes are condensed into a
+# "story so far" that every window of the next batch is given, so continuity
+# (set-ups, payoffs, arcs) survives the split. A film of one batch or less runs
+# exactly as before, with no recap call.
+_BATCH_MIN           = 120
+_MEMORY_MAX_OUTPUT   = 2048
 
 
 def _segment_windows(runtime_min: float) -> list[tuple[float, float]]:
-    """Split a runtime into viewing windows of roughly _SEGMENT_TARGET_MIN each.
-    Returns [(start_seconds, end_seconds), ...] — always at least one window."""
+    """Split a runtime into viewing windows of roughly _SEGMENT_TARGET_MIN each,
+    capped at _SEGMENT_MAX per batch. Returns [(start_seconds, end_seconds), ...]
+    — always at least one window."""
     total_s = max(float(runtime_min or 0), 0.0) * 60
     if total_s <= 0:
         return [(0.0, 0.0)]
-    n = max(1, min(math.ceil(runtime_min / _SEGMENT_TARGET_MIN), _SEGMENT_MAX))
+    batches = max(1, math.ceil(runtime_min / _BATCH_MIN))
+    n = max(1, min(math.ceil(runtime_min / _SEGMENT_TARGET_MIN), _SEGMENT_MAX * batches))
     step = total_s / n
     return [(i * step, min((i + 1) * step, total_s)) for i in range(n)]
+
+
+def _batch_windows(windows: list[tuple[float, float]]) -> list[list[int]]:
+    """Group window indices into _BATCH_MIN batches by their start time."""
+    batches: dict[int, list[int]] = {}
+    for i, (start_s, _end) in enumerate(windows):
+        batches.setdefault(int(start_s // (_BATCH_MIN * 60)), []).append(i)
+    return [batches[k] for k in sorted(batches)]
+
+
+def _recap_story_so_far(client, model_id: str, prior_memory: str, batch_notes: list[str],
+                        upto_s: float, runtime_min: float, job_id: str) -> str:
+    """Fold a finished batch's notes into the running 'story so far'. Best effort:
+    if the recap call fails, the next batch is watched without it rather than
+    failing the whole film."""
+    db.job_update(job_id, {"status": "analysing",
+                            "message": "Recapping the story so far before watching on…"})
+    try:
+        resp = _gemini_generate_with_retry(
+            client, model_id,
+            build_memory_prompt(prior_memory, batch_notes, upto_s, runtime_min),
+            types.GenerateContentConfig(
+                temperature=0.2,
+                max_output_tokens=_MEMORY_MAX_OUTPUT,
+                thinking_config=types.ThinkingConfig(thinking_budget=0),
+                safety_settings=_FILM_SAFETY,
+            ),
+        )
+        return _response_text(resp).strip() or prior_memory
+    except Exception as e:
+        logging.warning("[segments] recap failed for job %s, continuing without it: %s", job_id, e)
+        return prior_memory
 
 
 def _analyse_film_in_segments(client, model_id: str, video_uri: str, video_mime: str | None,
@@ -670,7 +712,7 @@ def _analyse_film_in_segments(client, model_id: str, video_uri: str, video_mime:
         "safety_settings": _FILM_SAFETY,
     }
 
-    def _watch(i: int) -> tuple[int, str, bool]:
+    def _watch(i: int, story_so_far: str) -> tuple[int, str, bool]:
         start_s, end_s = windows[i]
         part = types.Part(
             file_data=(types.FileData(file_uri=video_uri, mime_type=video_mime)
@@ -679,26 +721,33 @@ def _analyse_film_in_segments(client, model_id: str, video_uri: str, video_mime:
                                                 end_offset=f"{int(math.ceil(end_s))}s"),
         )
         prompt = build_segment_analysis_prompt(festival, meta, i, total,
-                                                start_s, end_s, runtime_min)
+                                                start_s, end_s, runtime_min, story_so_far)
         resp, low = _analyse_video_with_resolution_fallback(
             client, model_id, [part, prompt], seg_config, job_id, notify=False)
         return i, _response_text(resp).strip(), low
 
+    batches = _batch_windows(windows)
+    memory  = ""
     from concurrent.futures import ThreadPoolExecutor, as_completed
-    with ThreadPoolExecutor(max_workers=min(_SEGMENT_WORKERS, total)) as pool:
-        futures = [pool.submit(_watch, i) for i in range(total)]
-        for fut in as_completed(futures):
-            i, text, low = fut.result()
-            notes[i] = text
-            with lock:
-                used_low = used_low or low
-                done += 1
-                # Segment viewing spans progress 65 → 85
-                db.job_update(job_id, {
-                    "status": "analysing",
-                    "progress": 65 + int(20 * done / total),
-                    "message": f"Watching the film in detail — section {done} of {total}…",
-                })
+    for b, batch in enumerate(batches):
+        with ThreadPoolExecutor(max_workers=min(_SEGMENT_WORKERS, len(batch))) as pool:
+            futures = [pool.submit(_watch, i, memory) for i in batch]
+            for fut in as_completed(futures):
+                i, text, low = fut.result()
+                notes[i] = text
+                with lock:
+                    used_low = used_low or low
+                    done += 1
+                    # Segment viewing spans progress 65 → 85
+                    db.job_update(job_id, {
+                        "status": "analysing",
+                        "progress": 65 + int(20 * done / total),
+                        "message": f"Watching the film in detail — section {done} of {total}…",
+                    })
+        if b < len(batches) - 1:
+            memory = _recap_story_so_far(client, model_id, memory,
+                                         [notes[i] for i in batch],
+                                         windows[batch[-1]][1], runtime_min, job_id)
 
     db.job_update(job_id, {"status": "analysing", "progress": 86,
                             "message": "Weighing the film as a whole…"})
@@ -842,7 +891,7 @@ def process_video(job_id: str, video_path: str, meta: dict):
                                 "message": "Waiting for a processing slot (server is busy)…"})
         _processing_sem.acquire()  # now block for real
     from downloader import get_video_duration, stream_to_gcs, delete_from_gcs, extract_keyframes
-    from config import DIRECT_UPLOAD_MAX_MIN, CHUNK_FRAMES
+    from config import DIRECT_UPLOAD_MAX_MIN, YOUTUBE_MAX_MIN, CHUNK_FRAMES
 
     GCS_BUCKET = os.getenv("GCS_BUCKET", "")
 
@@ -872,10 +921,10 @@ def process_video(job_id: str, video_path: str, meta: dict):
                                     "message": "Fetching the film from YouTube…"})
             yt = _youtube_meta(yt_url)
             duration_min = float(yt.get("runtime_min") or 0)
-            if duration_min > DIRECT_UPLOAD_MAX_MIN:
+            if duration_min > YOUTUBE_MAX_MIN:
                 raise RuntimeError(
                     f"Film is {round(duration_min)} minutes long. "
-                    f"Only films up to {DIRECT_UPLOAD_MAX_MIN} minutes are accepted.")
+                    f"Only films up to {YOUTUBE_MAX_MIN} minutes are accepted.")
             if duration_min <= 0:
                 # No runtime available: analyse as a single window rather than
                 # guessing a segmentation that would misreport timestamps.

@@ -195,7 +195,7 @@ def _fmt_ts(seconds: float) -> str:
 
 def build_segment_analysis_prompt(festival: dict, film_meta: dict, seg_index: int,
                                   seg_count: int, start_s: float, end_s: float,
-                                  runtime_min: float) -> str:
+                                  runtime_min: float, story_so_far: str = "") -> str:
     """Viewing notes for ONE window of the film.
 
     A juror watches a feature in one sitting taking notes throughout; a single
@@ -222,6 +222,15 @@ def build_segment_analysis_prompt(festival: dict, film_meta: dict, seg_index: in
         "the MIDDLE of the film"
     )
 
+    # Long films are watched in batches; later batches carry a recap of the
+    # earlier ones so continuity (set-ups, payoffs, arcs) isn't lost between them.
+    memory_block = f"""
+THE STORY SO FAR — your own recap of the film before this section. Use it to track
+continuity: name callbacks and payoffs of earlier set-ups, and how characters and themes
+have developed. Do not re-review earlier sections; report only what happens in THIS one.
+{story_so_far}
+""" if story_so_far else ""
+
     return f"""
 You are a professional film critic and senior festival juror taking detailed viewing
 notes for {festival['full_name']}. You are watching ONE SECTION of a film that runs
@@ -230,6 +239,7 @@ notes for {festival['full_name']}. You are watching ONE SECTION of a film that r
 THIS SECTION: part {seg_index + 1} of {seg_count}, covering {_fmt_ts(start_s)} to
 {_fmt_ts(end_s)} of the finished film. This is {where}.
 {context_block}
+{memory_block}
 
 Watch this section closely and write precise, evidence-based viewing notes. Every
 observation must be anchored to a specific moment. IMPORTANT: express all timestamps in
@@ -251,6 +261,27 @@ Cover, in plain prose (no JSON, no markdown headers):
 Be specific and unsparing but fair. Do not summarise the whole film — report only what
 you actually observe in THIS section. If the section is largely uneventful, say so
 plainly rather than inventing incident.
+"""
+
+
+def build_memory_prompt(prior_memory: str, batch_notes: list[str],
+                        upto_s: float, runtime_min: float) -> str:
+    """Condense the viewing notes so far into a compact 'story so far' that the
+    next batch of sections is watched with. Text only — no video."""
+    notes_block = "\n\n".join(n for n in batch_notes if n)
+    prior_block = f"RECAP OF EVERYTHING EARLIER:\n{prior_memory}\n\n" if prior_memory else ""
+    return f"""
+You are a film critic part-way through a {round(runtime_min)}-minute film, at
+{_fmt_ts(upto_s)}. Write a compact recap of the film SO FAR to carry into the rest
+of your viewing. Plain prose, at most 400 words, covering:
+- the story up to this point and where it stands now;
+- the main characters and how each has developed;
+- set-ups, open questions and unresolved threads still awaiting a payoff;
+- recurring motifs, visual or musical ideas, and the film's tonal register.
+Keep key moments' timestamps. Facts only — no scores, no verdicts.
+
+{prior_block}VIEWING NOTES FOR THE LATEST STRETCH:
+{notes_block}
 """
 
 
