@@ -4372,7 +4372,7 @@ function clearFilmFields() {
 }
 
 function _updateSubmitBtn() {
-  document.getElementById('submitBtn').disabled = selectedFile === null;
+  updateSourceMode();
 }
 
 // ── Script / written-work category detection & upload-mode toggle ──
@@ -4523,7 +4523,9 @@ async function submitReview() {
   if (!title || !director) { showError('Film title and director are required'); return; }
   if (!genre)              { showError('Genre / Category is required'); return; }
 
-  if (!selectedFile) { showError(isScriptCategory() ? 'Please upload your script (PDF, DOC, DOCX, or TXT)' : 'Please upload a video file to continue'); return; }
+  // A film may come from a picked file OR a valid YouTube link; scripts need a file.
+  const ytOk = !isScriptCategory() && YT_RE.test(youtubeUrlValue());
+  if (!selectedFile && !ytOk) { showError(isScriptCategory() ? 'Please upload your script (PDF, DOC, DOCX, or TXT)' : 'Please upload a video file or paste a YouTube link'); return; }
 
   // ── Script/document categories: small file → POST directly to /upload ──
   if (isScriptCategory()) {
