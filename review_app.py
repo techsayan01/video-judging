@@ -395,10 +395,17 @@ def _visible_festival_keys() -> list[str]:
 
 
 # ── Helpers ───────────────────────────────────────────────
+class YouTubeAccessError(RuntimeError):
+    """Gemini refused to read a YouTube link (403) — almost always because the
+    video is unlisted or private. Its message is written for the user."""
+
+
 def _friendly_error(e: Exception) -> str:
     """Turn a raw exception into an actionable message. In particular, detect
     invalid/expired/revoked Gemini API keys, which otherwise surface as an
     opaque 400/401/403 from the SDK and get mistaken for content-safety blocks."""
+    if isinstance(e, YouTubeAccessError):
+        return str(e)
     msg = str(e)
     low = msg.lower()
     if any(s in low for s in ("api key not valid", "api_key_invalid", "invalid api key",
@@ -459,7 +466,8 @@ def _gemini_generate_with_retry(client, model_id: str, contents, config,
 # container: no yt-dlp, no residential proxy to dodge YouTube's datacenter-IP
 # blocking, no GCS object, nothing in RAM-backed /tmp. Clip offsets work on a
 # YouTube URL exactly as they do on an uploaded file, so segmented viewing is
-# unchanged. The video must be public or unlisted — private videos are rejected.
+# unchanged. The video must be PUBLIC — Gemini rejects unlisted and private
+# videos with 403 PERMISSION_DENIED (verified), see YouTubeAccessError.
 _YT_RE = re.compile(
     r"^https?://(?:www\.|m\.)?(?:youtube\.com/(?:watch\?(?:.*&)?v=|live/|shorts/|embed/)|youtu\.be/)"
     r"(?P<id>[A-Za-z0-9_-]{11})",
@@ -936,8 +944,19 @@ def process_video(job_id: str, video_path: str, meta: dict):
 
             db.job_update(job_id, {"status": "analysing", "progress": 65,
                                     "message": "Scoring story, direction & craft…"})
-            analysis, used_low_res = _analyse_film_in_segments(
-                client, model_id, yt_url, None, festival, meta, duration_min, job_id)
+            try:
+                analysis, used_low_res = _analyse_film_in_segments(
+                    client, model_id, yt_url, None, festival, meta, duration_min, job_id)
+            except Exception as e:
+                # The key itself worked for every other film; a 403 here is Gemini
+                # refusing this video, which it does for unlisted/private links.
+                if "permission_denied" in str(e).lower():
+                    raise YouTubeAccessError(
+                        "Gemini couldn't open this YouTube video. Set its visibility to "
+                        "Public — unlisted and private videos can't be read — or upload "
+                        "the film file instead. If the video is already public, ask an "
+                        "admin to check this festival's Gemini API key.") from e
+                raise
             if used_low_res:
                 analysis["quality_warning"] = (
                     "This film exceeded Gemini's analysis context window at full detail, so it was "
@@ -4246,7 +4265,7 @@ APP_BODY = """<div class="main">
                  style="width:100%;background:var(--bg3);border:1px solid rgba(255,255,255,.08);
                         border-radius:8px;color:var(--text);padding:10px 14px;font-size:13px">
           <div id="ytHint" style="font-size:11px;color:var(--muted);margin-top:6px;line-height:1.5">
-            The video must be <strong>public or unlisted</strong> — private videos cannot be read.
+            The video must be <strong>public</strong> — unlisted and private videos cannot be read.
           </div>
         </div>
 
@@ -4424,7 +4443,7 @@ function updateSourceMode() {
       : 'That does not look like a YouTube link (youtube.com/watch or youtu.be).';
     hint.style.color = ytValid ? 'var(--green)' : 'var(--red, #e5534b)';
   } else if (hint) {
-    hint.innerHTML = 'The video must be <strong>public or unlisted</strong> — private videos cannot be read.';
+    hint.innerHTML = 'The video must be <strong>public</strong> — unlisted and private videos cannot be read.';
     hint.style.color = 'var(--muted)';
   }
   // Pasting a link supersedes a picked file, and vice versa
