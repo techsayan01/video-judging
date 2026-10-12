@@ -146,7 +146,7 @@ _REVIEW_SAFETY = [
     types.SafetySetting(category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="BLOCK_ONLY_HIGH"),
 ]
 
-from config import GEMINI_MODEL, REVIEW_MODEL, RETIRED_MODELS  # noqa: E402
+from config import GEMINI_MODEL, REVIEW_MODEL, WATCH_MODEL, RETIRED_MODELS  # noqa: E402
 
 # ── Input sanitisation helpers ────────────────────────────
 _ALLOWED_TAGS: list[str] = []  # strip ALL HTML from text fields
@@ -701,13 +701,17 @@ def _recap_story_so_far(client, model_id: str, prior_memory: str, batch_notes: l
 
 
 def _analyse_film_in_segments(client, model_id: str, video_uri: str, video_mime: str | None,
-                               festival: dict, meta: dict, runtime_min: float, job_id: str):
+                               festival: dict, meta: dict, runtime_min: float, job_id: str,
+                               watch_model: str | None = None):
     """Watch the film window by window, then synthesise a scored assessment.
 
     video_uri is either a Gemini Files API uri (uploaded film, with its mime
     type) or a public YouTube watch URL (video_mime None) — clip offsets behave
     identically for both, so segmented viewing needs no other change.
+    watch_model watches the clips (the bulk of the cost); model_id writes the
+    recap and the final scored assessment from the notes.
     Returns (analysis_dict, used_low_resolution)."""
+    watch_model = watch_model or model_id
     windows   = _segment_windows(runtime_min)
     total     = len(windows)
     notes     = [""] * total
@@ -733,7 +737,7 @@ def _analyse_film_in_segments(client, model_id: str, video_uri: str, video_mime:
         prompt = build_segment_analysis_prompt(festival, meta, i, total,
                                                 start_s, end_s, runtime_min, story_so_far)
         resp, low = _analyse_video_with_resolution_fallback(
-            client, model_id, [part, prompt], seg_config, job_id, notify=False)
+            client, watch_model, [part, prompt], seg_config, job_id, notify=False)
         return i, _response_text(resp).strip(), low
 
     batches = _batch_windows(windows)
@@ -948,7 +952,8 @@ def process_video(job_id: str, video_path: str, meta: dict):
                                     "message": "Scoring story, direction & craft…"})
             try:
                 analysis, used_low_res = _analyse_film_in_segments(
-                    client, model_id, yt_url, None, festival, meta, duration_min, job_id)
+                    client, model_id, yt_url, None, festival, meta, duration_min, job_id,
+                    watch_model=WATCH_MODEL)
             except Exception as e:
                 # The key itself worked for every other film; a 403 here is Gemini
                 # refusing this video, which it does for unlisted/private links.
@@ -1102,7 +1107,8 @@ def process_video(job_id: str, video_path: str, meta: dict):
         db.job_update(job_id, {"status": "analysing", "progress": 65,
                                 "message": "Scoring story, direction & craft…"})
         analysis, used_low_res = _analyse_film_in_segments(
-            client, model_id, f.uri, f.mime_type, festival, meta, duration_min, job_id)
+            client, model_id, f.uri, f.mime_type, festival, meta, duration_min, job_id,
+            watch_model=WATCH_MODEL)
         if used_low_res:
             analysis["quality_warning"] = (
                 "This film exceeded Gemini's analysis context window at full detail, so it was "
