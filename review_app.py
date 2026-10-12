@@ -9,10 +9,10 @@ Cost optimisations applied:
      entirely and only call the cheap text review-writing step (~0.01¢ vs ~1.6¢).
      Dedup by screener URL or title+director — works across festivals and
      across the batch pipeline (pipeline.py shares the same DB).
-  2. Lite model for review writing — gemini-2.5-flash-lite used for the
-     text-only review step (prose quality identical, ~70% cheaper output tokens).
-  3. Thinking disabled on review call — gemini-2.5-flash thinking tokens
-     cost $3.50/1M; disabled with thinking_budget=0 on prose generation.
+  2. Lite model for review writing — config.REVIEW_MODEL is used for the
+     text-only review step (prose quality comparable, much cheaper tokens).
+  3. Thinking kept minimal on the review call (thinking_budget=0) — thinking
+     tokens bill as output on prose generation.
 """
 
 import os, json, uuid, threading, tempfile, time, re, secrets, logging, math
@@ -146,8 +146,7 @@ _REVIEW_SAFETY = [
     types.SafetySetting(category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="BLOCK_ONLY_HIGH"),
 ]
 
-# Lite model used for text-only review writing (cheaper, same prose quality)
-REVIEW_MODEL = "gemini-2.5-flash-lite"
+from config import GEMINI_MODEL, REVIEW_MODEL, RETIRED_MODELS  # noqa: E402
 
 # ── Input sanitisation helpers ────────────────────────────
 _ALLOWED_TAGS: list[str] = []  # strip ALL HTML from text fields
@@ -279,7 +278,8 @@ def get_festivals() -> dict:
             os.getenv(f"{env}_GEMINI_KEY") or
             os.getenv("GEMINI_API_KEY", "")
         )
-        f.setdefault("gemini_model", "gemini-2.5-flash")
+        f["gemini_model"] = RETIRED_MODELS.get(f.get("gemini_model") or GEMINI_MODEL,
+                                               f.get("gemini_model") or GEMINI_MODEL)
         f.setdefault("word_count", 500)
         # Admins no longer set review prompts — guarantee a sensible default
         if not (f.get("review_prompt") or "").strip():
@@ -645,14 +645,14 @@ _SEGMENT_TARGET_MIN  = 10    # aim for ~10-minute viewing windows
 _SEGMENT_MAX         = 12    # cap windows per batch so each batch stays bounded
 _SEGMENT_WORKERS     = 3     # concurrent segment calls (API calls are I/O bound)
 _SEGMENT_THINKING    = 4096  # thinking budget per segment — depth lives here
-_SEGMENT_MAX_OUTPUT  = 4096
+_SEGMENT_MAX_OUTPUT  = 8192  # includes the thinking budget, which counts toward it
 # Films longer than one batch are watched batch by batch. Windows inside a batch
 # run in parallel as before; between batches the notes are condensed into a
 # "story so far" that every window of the next batch is given, so continuity
 # (set-ups, payoffs, arcs) survives the split. A film of one batch or less runs
 # exactly as before, with no recap call.
 _BATCH_MIN           = 120
-_MEMORY_MAX_OUTPUT   = 2048
+_MEMORY_MAX_OUTPUT   = 4096
 
 
 def _segment_windows(runtime_min: float) -> list[tuple[float, float]]:
@@ -877,7 +877,7 @@ def _write_review(client: genai.Client, meta: dict,
         contents=build_review_prompt(meta, analysis, festival),
         config=types.GenerateContentConfig(
             temperature=0.7,
-            max_output_tokens=2048,
+            max_output_tokens=4096,
             thinking_config=types.ThinkingConfig(thinking_budget=0),
             safety_settings=_REVIEW_SAFETY,
         ),
@@ -909,7 +909,7 @@ def process_video(job_id: str, video_path: str, meta: dict):
     fk       = meta.get("festival_key", DEFAULT_FESTIVAL)
     festival = get_festivals().get(fk) or get_festival(fk)
     client   = genai.Client(api_key=festival["gemini_api_key"], http_options=_GEMINI_HTTP_OPTIONS)
-    model_id = festival.get("gemini_model", "gemini-2.5-flash")
+    model_id = festival.get("gemini_model", GEMINI_MODEL)
 
     uploaded_files: list = []   # Gemini Files API handles to clean up
     gcs_blob: str        = ""   # GCS blob name to clean up
@@ -1210,7 +1210,7 @@ def process_document(job_id: str, doc_path: str, ext: str, meta: dict):
     fk       = meta.get("festival_key", DEFAULT_FESTIVAL)
     festival = get_festivals().get(fk) or get_festival(fk)
     client   = genai.Client(api_key=festival["gemini_api_key"], http_options=_GEMINI_HTTP_OPTIONS)
-    model_id = festival.get("gemini_model", "gemini-2.5-flash")
+    model_id = festival.get("gemini_model", GEMINI_MODEL)
     uploaded_files: list = []
     try:
         film_id = meta.get("film_id") or uuid.uuid4().hex
@@ -2047,7 +2047,7 @@ def _festival_fields_from_form() -> dict:
         "focus":          _sanitise(request.form.get("focus", ""), MAX_TEXTAREA_LEN),
         "tone":           _sanitise(request.form.get("tone", "")) or "professional, honest, and encouraging",
         "gemini_api_key": request.form.get("gemini_api_key", "").strip()[:256],
-        "gemini_model":   "gemini-2.5-flash",
+        "gemini_model":   GEMINI_MODEL,
         "word_count":     500,
     }
 
@@ -2376,7 +2376,7 @@ def api_wp_template_generate(key):
         return jsonify({"error": "No Gemini API key configured for this festival."}), 400
     try:
         client = genai.Client(api_key=api_key, http_options=_GEMINI_HTTP_OPTIONS)
-        model  = festival.get("gemini_model", "gemini-2.5-flash")
+        model  = festival.get("gemini_model", GEMINI_MODEL)
         template = wordpress.generate_template_from_reference(client, model, ref_html[:60000])
     except Exception as e:
         return jsonify({"error": _friendly_error(e)}), 502

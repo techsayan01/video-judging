@@ -18,6 +18,7 @@ DEFAULT_FESTIVAL env var controls which festival is pre-selected in the UI.
 
 import os
 from dotenv import load_dotenv
+from config import GEMINI_MODEL
 
 load_dotenv()
 
@@ -29,7 +30,7 @@ def _cfg(slug: str, **kwargs) -> dict:
     return {
         **kwargs,
         "gemini_api_key": os.getenv(f"{env}_GEMINI_KEY", os.getenv("GEMINI_API_KEY", "")),
-        "gemini_model":   kwargs.get("gemini_model", "gemini-2.5-flash"),
+        "gemini_model":   kwargs.get("gemini_model", GEMINI_MODEL),
         "wp_url":         os.getenv(f"{env}_WP_URL", ""),
         "wp_user":        os.getenv(f"{env}_WP_USER", "admin"),
         "wp_app_pass":    os.getenv(f"{env}_WP_PASS", ""),

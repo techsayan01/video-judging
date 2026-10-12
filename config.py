@@ -12,7 +12,12 @@ load_dotenv()
 
 # ── Gemini (global fallback — override per festival in festivals.py) ──────────
 GEMINI_API_KEY   = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL     = "gemini-2.5-flash"
+GEMINI_MODEL     = "gemini-3.8-flash"       # film analysis (video)
+REVIEW_MODEL     = "gemini-3.1-flash-lite"  # text-only review writing
+# Models Google has closed to new projects. Festival records saved before the
+# switch still name them, so they are mapped to the current model on load.
+RETIRED_MODELS   = {"gemini-2.5-flash": GEMINI_MODEL, "gemini-2.5-flash-lite": REVIEW_MODEL,
+                    "gemini-1.5-pro": GEMINI_MODEL, "gemini-1.5-flash": GEMINI_MODEL}
 GEMINI_MODEL_PRO = "gemini-1.5-pro"
 
 # ── Film length thresholds ────────────────────────────────────────────────────
